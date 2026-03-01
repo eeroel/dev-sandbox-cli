@@ -6,8 +6,6 @@ All infrastructure (network, squid proxy) is created if not present — idempote
 Default sandbox name is derived from the repo directory name.
 
 TODO:
-  - BUG: `edit-mounts` validates JSON syntax only; invalid mount schema (not str->str)
-    is accepted at edit time and only handled later with runtime fallback.
   - Add `--pull` flag to `up` to refresh the base image before rebuilding (for OS/base updates)
   - Orphaned volume dirs in workspaces flagged in `status` but not cleaned automatically;
     consider an `sandbox.py prune` command
@@ -24,12 +22,9 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
-from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 
 _REPO_DEFAULT = "__repo__"  # sentinel: derive name from repo dir
 
@@ -47,7 +42,8 @@ SQUID_CONTAINER_NAME = "sandbox-squid"
 SQUID_IMAGE = "ubuntu/squid:latest"
 SQUID_PORT = 3128
 
-DEFAULT_ALLOWLIST = []
+DEFAULT_ALLOWLIST = [
+]
 
 DOCKER = shutil.which("podman") or shutil.which("docker")
 SANDBOX_DOCKERFILE_NAME = ".sandbox-dockerfile"  # repo-level override
@@ -108,9 +104,7 @@ exec "$@"
 
 def _parse_mounts(data: object, source: str) -> dict[str, str]:
     if not isinstance(data, dict):
-        raise ValueError(
-            f"{source} must contain a JSON object mapping host-relative paths to container paths."
-        )
+        raise ValueError(f"{source} must contain a JSON object mapping host-relative paths to container paths.")
     parsed = {}
     for k, v in data.items():
         if not isinstance(k, str) or not isinstance(v, str):
@@ -148,9 +142,7 @@ def load_profile(profile_dir: Path | None) -> dict:
 
     if mounts_path.exists():
         try:
-            profile["mounts"] = _parse_mounts(
-                json.loads(mounts_path.read_text()), str(mounts_path)
-            )
+            profile["mounts"] = _parse_mounts(json.loads(mounts_path.read_text()), str(mounts_path))
         except (json.JSONDecodeError, ValueError) as e:
             die(f"Invalid JSON in {mounts_path}: {e}")
     if dockerfile_path.exists():
@@ -162,20 +154,20 @@ def load_profile(profile_dir: Path | None) -> dict:
 
     return profile
 
-
 # ---------------------------------------------------------------------------
 # Sandbox dataclass
 # ---------------------------------------------------------------------------
-
 
 @dataclass
 class Sandbox:
     name: str
     repo: Path
+    # profile is only used during first-time provisioning (_provision).
+    # After that, seeded files on disk are the source of truth.
     profile: dict | None = None
     profile_explicit: bool = False
 
-    # --- Path properties ---------------------------------------------------
+    # --- Paths ---------------------------------------------------
 
     @property
     def meta_dir(self) -> Path:
@@ -198,47 +190,41 @@ class Sandbox:
         return f"sandbox-{self.name}:latest"
 
     @property
-    def config(self) -> "SandboxConfig":
-        return SandboxConfig(
-            self, profile=self.profile or copy.deepcopy(DEFAULT_PROFILE)
-        )
+    def dockerfile_path(self) -> Path:
+        return self.meta_dir / "Dockerfile"
+
+    @property
+    def repo_dockerfile_path(self) -> Path:
+        return self.repo / SANDBOX_DOCKERFILE_NAME
+
+    @property
+    def mounts_file(self) -> Path:
+        return self.meta_dir / "mounts.json"
+
+    @property
+    def entrypoint_path(self) -> Path:
+        return self.meta_dir / "entrypoint.sh"
 
     # --- Meta persistence --------------------------------------------------
 
     def load_meta(self) -> dict:
         p = self.meta_dir / "meta.json"
-        if p.exists():
-            return json.loads(p.read_text())
-        return {}
+        return json.loads(p.read_text()) if p.exists() else {}
 
     def save_meta(self, meta: dict):
-        """Write meta atomically via temp file + rename."""
         p = self.meta_dir / "meta.json"
-        dir_ = p.parent
-        dir_.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=dir_, prefix=".meta-")
-        try:
-            with os.fdopen(fd, "w") as f:
-                json.dump(meta, f, indent=2)
-            os.replace(tmp, p)
-        except Exception:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(meta, indent=2))
 
     def update_meta(self, patch: dict):
-        """Merge keys into meta.json atomically."""
         meta = self.load_meta()
         meta.update(patch)
         self.save_meta(meta)
 
-    # --- Alternative constructors ------------------------------------------
+    # --- Alternative constructor ------------------------------------------
 
     @classmethod
     def load(cls, name: str) -> "Sandbox":
-        """Reconstruct a Sandbox from its persisted meta.json."""
         meta_path = INSTANCES_DIR / name / "meta.json"
         if not meta_path.exists():
             die(f"No meta found for sandbox '{name}'. Has it been created with `up`?")
@@ -250,150 +236,44 @@ class Sandbox:
 
 
 # ---------------------------------------------------------------------------
-# Sandbox config abstraction
+# Per-sandbox file helpers (operate on seeded files in meta_dir)
 # ---------------------------------------------------------------------------
 
+def resolve_dockerfile(sb: Sandbox, explicit_dockerfile: str = None) -> Path:
+    """Resolve Dockerfile path: explicit > repo override > seeded default."""
+    if explicit_dockerfile:
+        p = Path(explicit_dockerfile).resolve()
+        if not p.exists():
+            raise FileNotFoundError(f"--dockerfile not found: {p}")
+        return p
+    if sb.repo_dockerfile_path.exists():
+        return sb.repo_dockerfile_path
+    # Fall back to seeded default, writing it if this is somehow missing.
+    if not sb.dockerfile_path.exists():
+        profile = sb.profile or copy.deepcopy(DEFAULT_PROFILE)
+        sb.dockerfile_path.write_text(profile["dockerfile"])
+        print(f"[image] No repo Dockerfile found — wrote default to {sb.dockerfile_path}")
+    else:
+        print(f"[image] No repo Dockerfile found — using existing default at {sb.dockerfile_path}")
+    return sb.dockerfile_path
 
-@dataclass
-class SandboxConfig:
-    sandbox: Sandbox
-    profile: dict
 
-    @property
-    def mounts_file(self) -> Path:
-        return self.sandbox.meta_dir / "mounts.json"
-
-    @property
-    def default_dockerfile_path(self) -> Path:
-        return self.sandbox.meta_dir / "Dockerfile"
-
-    @property
-    def repo_dockerfile_path(self) -> Path:
-        return self.sandbox.repo / SANDBOX_DOCKERFILE_NAME
-
-    @property
-    def entrypoint_path(self) -> Path:
-        return self.sandbox.meta_dir / "entrypoint.sh"
-
-    @property
-    def triggers_file(self) -> Path:
-        return self.sandbox.meta_dir / "rebuild_triggers.txt"
-
-    def require_managed_file(self, path: Path, label: str) -> Path:
-        """Ensure a managed metadata file exists and is readable."""
+def load_mounts(sb: Sandbox) -> dict:
+    """Load mount mappings from seeded mounts.json. Falls back to profile defaults."""
+    if sb.mounts_file.exists():
         try:
-            with path.open("rb"):
-                pass
-        except FileNotFoundError as e:
-            raise FileNotFoundError(f"Managed {label} missing: {path}") from e
-        except IsADirectoryError as e:
-            raise ValueError(f"Managed {label} is not a file: {path}") from e
-        except OSError as e:
-            raise ValueError(f"Cannot read managed {label}: {path}: {e}") from e
-        return path
+            return _parse_mounts(json.loads(sb.mounts_file.read_text()), str(sb.mounts_file))
+        except (json.JSONDecodeError, ValueError):
+            print(f"WARNING: Malformed {sb.mounts_file}. Using defaults.")
+    profile = sb.profile or copy.deepcopy(DEFAULT_PROFILE)
+    return profile["mounts"]
 
-    def ensure_mounts_file(self) -> Path:
-        """Write mounts.json if missing."""
-        self.mounts_file.parent.mkdir(parents=True, exist_ok=True)
-        if not self.mounts_file.exists():
-            self.mounts_file.write_text(json.dumps(self.profile["mounts"], indent=2))
-            print(f"[mounts] No manifest found — wrote default to {self.mounts_file}")
-        self.load_mounts(require_file=True)
-        return self.mounts_file
-
-    def load_mounts(self, require_file=False) -> dict[str, str]:
-        """Load mount mappings. Relative path -> Container path."""
-        try:
-            raw = self.mounts_file.read_text()
-        except FileNotFoundError:
-            if require_file:
-                raise FileNotFoundError(
-                    f"Managed mounts manifest missing: {self.mounts_file}"
-                )
-            return self.profile["mounts"]
-        except IsADirectoryError as e:
-            raise ValueError(
-                f"Managed mounts manifest is not a file: {self.mounts_file}"
-            ) from e
-        except OSError as e:
-            raise ValueError(f"Cannot read mounts manifest {self.mounts_file}: {e}") from e
-        try:
-            return _parse_mounts(
-                json.loads(raw), str(self.mounts_file)
-            )
-        except (json.JSONDecodeError, ValueError) as e:
-            raise ValueError(f"Invalid mounts manifest {self.mounts_file}: {e}") from e
-
-    def ensure_default_dockerfile(self, seed_source: Path | None = None) -> Path:
-        """Write managed Dockerfile if missing."""
-        self.default_dockerfile_path.parent.mkdir(parents=True, exist_ok=True)
-        if not self.default_dockerfile_path.exists():
-            if seed_source is not None:
-                self.default_dockerfile_path.write_text(seed_source.read_text())
-                print(
-                    f"[image] Seeded Dockerfile from {seed_source} -> {self.default_dockerfile_path}"
-                )
-            else:
-                self.default_dockerfile_path.write_text(self.profile["dockerfile"])
-                print(
-                    f"[image] No seed Dockerfile found — wrote default to {self.default_dockerfile_path}"
-                )
-        return self.require_managed_file(self.default_dockerfile_path, "Dockerfile")
-
-    def ensure_entrypoint(self) -> Path:
-        """Write default entrypoint script only if missing."""
-        script = self.profile["entrypoint_script"]
-        self.entrypoint_path.parent.mkdir(parents=True, exist_ok=True)
-        if not self.entrypoint_path.exists():
-            self.entrypoint_path.write_text(script)
-            print(
-                f"[entrypoint] No script found — wrote default to {self.entrypoint_path}"
-            )
-        entrypoint = self.require_managed_file(self.entrypoint_path, "entrypoint")
-        entrypoint.chmod(0o755)
-        return entrypoint
-
-    def ensure_triggers_file(self) -> Path:
-        if not self.triggers_file.exists():
-            content = "\n".join(self.profile["rebuild_triggers"])
-            self.triggers_file.write_text(content)
-        return self.triggers_file
-
-    def load_triggers(self) -> list[str]:
-        if self.triggers_file.exists():
-            return [l.strip() for l in self.triggers_file.read_text().splitlines() if l.strip()]
-        return self.profile["rebuild_triggers"]
-    
-    # TODO move to a function instead?
-    def prepare_instance_dir(self, explicit_dockerfile: str = None):
-        self.sandbox.meta_dir.mkdir(parents=True, exist_ok=True)
-        self.sandbox.workspace_dir.mkdir(parents=True, exist_ok=True)
-        self.sandbox.state_dir.mkdir(parents=True, exist_ok=True)
-
-        seed = None
-        if explicit_dockerfile:
-            seed = Path(explicit_dockerfile).resolve()
-        elif self.repo_dockerfile_path.exists():
-            seed = self.repo_dockerfile_path
-        self.ensure_default_dockerfile(seed_source=seed)
-        self.ensure_mounts_file()
-        self.ensure_entrypoint()
-        self.ensure_triggers_file()
 
 # ---------------------------------------------------------------------------
 # CLI name/repo resolution
 # ---------------------------------------------------------------------------
 
-
 def resolve_sandbox(args) -> "Sandbox":
-    """
-    Resolve the sandbox name and repo from CLI args, returning a Sandbox.
-
-    Resolution rules:
-    - If args.repo is set, use it; otherwise look for git root of cwd.
-    - If args.name is the sentinel _REPO_DEFAULT, derive name from the repo dir.
-    - If only --name is given (no --repo), load repo from meta.json.
-    """
     name_arg = getattr(args, "name", _REPO_DEFAULT)
     repo_arg = getattr(args, "repo", None)
 
@@ -403,21 +283,16 @@ def resolve_sandbox(args) -> "Sandbox":
         return Sandbox(name=name, repo=repo)
 
     if name_arg != _REPO_DEFAULT:
-        # Name was explicitly provided — try to load repo from meta
         meta_path = INSTANCES_DIR / name_arg / "meta.json"
         if meta_path.exists():
             return Sandbox.load(name_arg)
-        # Meta not yet created (e.g. first `up --name foo`) — fall through to git root
         try:
             repo = repo_root()
         except SystemExit:
-            die(
-                f"Sandbox '{name_arg}' not yet created and not inside a git repo. "
-                "Use --repo to specify the repo path."
-            )
+            die(f"Sandbox '{name_arg}' not yet created and not inside a git repo. "
+                "Use --repo to specify the repo path.")
         return Sandbox(name=name_arg, repo=repo)
 
-    # Neither explicit name nor repo — derive both from cwd git root
     try:
         repo = repo_root()
     except SystemExit:
@@ -429,9 +304,7 @@ def resolve_sandbox(args) -> "Sandbox":
 # Helpers
 # ---------------------------------------------------------------------------
 
-
 def run(cmd: list, capture=False, check=True, **kwargs):
-    """Run a command, optionally capturing output."""
     if not capture:
         print(f"  $ {' '.join(str(c) for c in cmd)}")
     result = subprocess.run(
@@ -470,7 +343,6 @@ def image_exists(name: str) -> bool:
 
 
 def repo_root() -> Path:
-    """Find git repo root from cwd."""
     r = run(["git", "rev-parse", "--show-toplevel"], capture=True, check=False)
     if r.returncode != 0:
         die("Not inside a git repository.")
@@ -491,7 +363,6 @@ def hash_files(paths: list[Path]) -> str:
 
 
 def edit_file(path: Path) -> bool:
-    """Open $EDITOR for a file and return whether mtime increased."""
     mtime_before = path.stat().st_mtime
     subprocess.run([os.environ.get("EDITOR", "vi"), str(path)])
     return path.stat().st_mtime > mtime_before
@@ -500,7 +371,6 @@ def edit_file(path: Path) -> bool:
 # ---------------------------------------------------------------------------
 # Squid config generation
 # ---------------------------------------------------------------------------
-
 
 def write_squid_conf(allowlist: list[str]) -> Path:
     conf_dir = SANDBOX_HOME / "squid"
@@ -534,7 +404,6 @@ cache_store_log none
 # Infrastructure: network + squid
 # ---------------------------------------------------------------------------
 
-
 def ensure_network():
     if network_exists(NETWORK_NAME):
         print(f"[network] {NETWORK_NAME} already exists.")
@@ -556,22 +425,14 @@ def ensure_squid(allowlist: list[str] = None):
 
     conf_dir = write_squid_conf(allowlist)
     print("[squid] Starting squid proxy ...")
-    run(
-        [
-            DOCKER,
-            "run",
-            "-d",
-            "--name",
-            SQUID_CONTAINER_NAME,
-            "--network",
-            NETWORK_NAME,
-            "--restart",
-            "unless-stopped",
-            "-v",
-            f"{conf_dir}/squid.conf:/etc/squid/squid.conf:ro",
-            SQUID_IMAGE,
-        ]
-    )
+    run([
+        DOCKER, "run", "-d",
+        "--name", SQUID_CONTAINER_NAME,
+        "--network", NETWORK_NAME,
+        "--restart", "unless-stopped",
+        "-v", f"{conf_dir}/squid.conf:/etc/squid/squid.conf:ro",
+        SQUID_IMAGE,
+    ])
 
 
 # ---------------------------------------------------------------------------
@@ -584,15 +445,11 @@ GLOBAL_ALLOWLIST_FILE = SANDBOX_HOME / "allowlist.txt"
 def load_global_allowlist() -> list[str]:
     if not GLOBAL_ALLOWLIST_FILE.exists():
         return list(DEFAULT_ALLOWLIST)
-    return [
-        line.strip()
-        for line in GLOBAL_ALLOWLIST_FILE.read_text().splitlines()
-        if line.strip() and not line.startswith("#")
-    ]
+    return [line.strip() for line in GLOBAL_ALLOWLIST_FILE.read_text().splitlines()
+            if line.strip() and not line.startswith("#")]
 
 
 def reconfigure_squid(allowlist: list[str]):
-    """Write a new squid.conf and restart squid to apply it."""
     write_squid_conf(allowlist)
     if not container_running(SQUID_CONTAINER_NAME):
         print("[squid] Not running — config saved, will apply on next start.")
@@ -602,12 +459,14 @@ def reconfigure_squid(allowlist: list[str]):
 
 
 def edit_allowlist():
-    """Open $EDITOR on the global squid allowlist, persist it, reconfigure squid."""
     SANDBOX_HOME.mkdir(parents=True, exist_ok=True)
-    GLOBAL_ALLOWLIST_FILE.write_text(
-        "# Global squid allowlist (one domain per line, # = comment)\n"
-        + "".join(d + "\n" for d in load_global_allowlist())
-    )
+    # Seed the file with the header comment only on first creation.
+    # Never overwrite before editing — that would dirty mtime even on no-op edits.
+    if not GLOBAL_ALLOWLIST_FILE.exists():
+        GLOBAL_ALLOWLIST_FILE.write_text(
+            "# Global squid allowlist (one domain per line, # = comment)\n"
+            + "".join(d + "\n" for d in load_global_allowlist())
+        )
 
     if not edit_file(GLOBAL_ALLOWLIST_FILE):
         print("[allowlist] No changes.")
@@ -622,14 +481,18 @@ def edit_allowlist():
 # Image build
 # ---------------------------------------------------------------------------
 
-
 def image_needs_rebuild(sb: Sandbox, force: bool) -> tuple[bool, str]:
     """Pure read: check whether the image needs to be rebuilt.
-    Returns (needs_rebuild, current_hash). Does not modify any state."""
-    # Use the persisted list instead of the one currently in sb.config.profile
-    triggers = sb.config.load_triggers()
-    trigger_files = [sb.repo / f for f in triggers]
-    current_hash = hash_files(trigger_files)
+
+    Hashes repo trigger files AND the seeded Dockerfile so that manual edits
+    to it are reflected on the next `up`. mounts.json is excluded — mounts are
+    a runtime concern (passed as -v flags) with no bearing on image contents.
+    """
+    profile = sb.profile or DEFAULT_PROFILE
+    trigger_files = [sb.repo / f for f in profile["rebuild_triggers"]]
+    # Include the seeded Dockerfile so manual edits automatically trigger a rebuild.
+    instance_files = [sb.dockerfile_path]
+    current_hash = hash_files(trigger_files + instance_files)
 
     if force:
         return True, current_hash
@@ -644,41 +507,26 @@ def image_needs_rebuild(sb: Sandbox, force: bool) -> tuple[bool, str]:
     return True, current_hash
 
 
-def build_image(
-    sb: Sandbox,
-    current_hash: str,
-    no_cache=False,
-    dockerfile: Path | None = None,
-) -> None:
-    """Unconditionally build the image.
-    Raises CalledProcessError on build failure."""
-    dockerfile = dockerfile or sb.config.default_dockerfile_path
-    sb.config.require_managed_file(dockerfile, "Dockerfile")
+def build_image(sb: Sandbox, current_hash: str, no_cache=False, explicit_dockerfile: str = None) -> None:
+    """Unconditionally build the image."""
+    dockerfile = resolve_dockerfile(sb, explicit_dockerfile=explicit_dockerfile)
 
-    print(
-        f"[image] Building {sb.image_tag} (trigger hash: {current_hash}){' [no-cache]' if no_cache else ''} ..."
-    )
+    print(f"[image] Building {sb.image_tag} (trigger hash: {current_hash}){' [no-cache]' if no_cache else ''} ...")
     print(f"[image] Dockerfile: {dockerfile}")
     cmd = [DOCKER, "build", "-t", sb.image_tag, "-f", str(dockerfile)]
     if no_cache:
         cmd.append("--no-cache")
     cmd.append(str(sb.repo))
-    run(cmd)  # raises CalledProcessError on failure
+    run(cmd)
 
 
 # ---------------------------------------------------------------------------
 # Git: two-way remote setup
 # ---------------------------------------------------------------------------
 
-
 def setup_git_remotes(sb: Sandbox):
-    """
-    Inside the container the agent's origin = /repo/.git (the host .git, read-only mount).
-    On the host, we add a remote pointing at the agent's clone so you can cherry-pick.
-    """
     remote_name = f"agent-{sb.name}"
 
-    # Check if remote already exists on host
     r = run(["git", "-C", str(sb.repo), "remote"], capture=True, check=False)
     existing = r.stdout.splitlines()
 
@@ -688,17 +536,11 @@ def setup_git_remotes(sb: Sandbox):
 
     agent_git = sb.workspace_dir / ".git"
     if not agent_git.exists():
-        print(
-            "[git] Agent clone not yet initialised — remote will be added after first run."
-        )
-        print(
-            f"      Run: git -C {sb.repo} remote add {remote_name} {sb.workspace_dir}"
-        )
+        print("[git] Agent clone not yet initialised — remote will be added after first run.")
+        print(f"      Run: git -C {sb.repo} remote add {remote_name} {sb.workspace_dir}")
         return
 
-    run(
-        ["git", "-C", str(sb.repo), "remote", "add", remote_name, str(sb.workspace_dir)]
-    )
+    run(["git", "-C", str(sb.repo), "remote", "add", remote_name, str(sb.workspace_dir)])
     print(f"[git] Added host remote '{remote_name}' → {sb.workspace_dir}")
     print(f"      Fetch with: git fetch {remote_name}")
 
@@ -707,281 +549,145 @@ def setup_git_remotes(sb: Sandbox):
 # Sandbox container
 # ---------------------------------------------------------------------------
 
-
 def wait_for_clone(sb: Sandbox, timeout=60):
-    """Wait for the container to finish cloning the repository into the workspace."""
     print(f"[git] Waiting for initial clone in {sb.name}...")
+    # We poll workspace_dir on the host, which is the same directory bind-mounted
+    # into the container as /llm-workspace. The .git directory appearing there
+    # means the entrypoint's `git clone` has completed successfully.
     start_time = time.time()
     while time.time() - start_time < timeout:
         if (sb.workspace_dir / ".git").exists():
             return True
         if not container_running(sb.container_name):
             print("[git] Container stopped unexpectedly during clone.")
+            print(f"      Check logs with: {DOCKER} logs {sb.container_name}")
             return False
         time.sleep(0.5)
     print(f"[git] Timeout: Clone did not complete within {timeout}s.")
+    print(f"      Check logs with: {DOCKER} logs {sb.container_name}")
     return False
 
 
-def _restore_meta_snapshot(sb: Sandbox, existed_before: bool, meta_before: dict):
-    """Restore metadata to a known-good snapshot."""
-    meta_path = sb.meta_dir / "meta.json"
-    if existed_before:
-        sb.save_meta(meta_before)
-    elif meta_path.exists():
-        meta_path.unlink()
+def _ensure_infra():
+    """Preflight: bring up shared network and squid proxy if not already running."""
+    ensure_network()
+    ensure_squid(load_global_allowlist())
 
 
-def plan_up(sb: Sandbox, force_rebuild=False, explicit_dockerfile: str = None) -> dict:
-    """Compute the `up` plan with reads only (no filesystem/docker writes)."""
-    config = sb.config
-    dockerfile = config.default_dockerfile_path
-    mounts = config.load_mounts() 
-    entrypoint = config.entrypoint_path
+def up(sb: Sandbox, force_rebuild=False, no_cache=False, explicit_dockerfile: str = None):
+    print(f"\n=== sandbox up: {sb.name} ===\n")
+
+    _ensure_infra()
+    _provision(sb)
+
+    # Build image — may raise; image_needs_rebuild is a pure read.
     needs_rebuild, image_hash = image_needs_rebuild(sb, force=force_rebuild)
+    if needs_rebuild:
+        build_image(sb, image_hash, no_cache=no_cache, explicit_dockerfile=explicit_dockerfile)
+        sb.update_meta({"image_hash": image_hash})
 
-    dockerfile_seed_source: Path | None = None
+    if container_running(sb.container_name):
+        print(f"[container] {sb.container_name} is already running.")
+        setup_git_remotes(sb)
+        return
+
+    if container_exists(sb.container_name):
+        print(f"[container] Removing stopped container {sb.container_name} ...")
+        run([DOCKER, "rm", sb.container_name], check=False, capture=True)
+
+    _start(sb, explicit_dockerfile=explicit_dockerfile)
+
+
+def _provision(sb: Sandbox):
+    """Seed instance files on first creation only. Idempotent: no-ops if already provisioned."""
+    if sb.meta_dir.exists():
+        if sb.profile_explicit:
+            print(f"[profile] Instance '{sb.name}' already exists — ignoring --profile to protect manual edits.")
+            print(f"          To reset, run: sandbox.py destroy --name {sb.name} && sandbox.py up --profile ...")
+        return
+
+    print(f"[provision] First-time setup for '{sb.name}' ...")
+    profile = sb.profile or copy.deepcopy(DEFAULT_PROFILE)
+
+    sb.meta_dir.mkdir(parents=True, exist_ok=True)
+    sb.workspace_dir.mkdir(parents=True, exist_ok=True)
+    sb.state_dir.mkdir(parents=True, exist_ok=True)
+
+    sb.mounts_file.write_text(json.dumps(profile["mounts"], indent=2))
+    print(f"[provision] Wrote {sb.mounts_file}")
+
+    if not sb.repo_dockerfile_path.exists():
+        sb.dockerfile_path.write_text(profile["dockerfile"])
+        print(f"[provision] Wrote {sb.dockerfile_path}")
+
+    sb.entrypoint_path.write_text(profile["entrypoint_script"])
+    sb.entrypoint_path.chmod(0o755)
+    print(f"[provision] Wrote {sb.entrypoint_path}")
+
+    sb.save_meta({
+        "sandbox_name": sb.name,
+        "repo": str(sb.repo),
+        "workspace_dir": str(sb.workspace_dir),
+        "state_dir": str(sb.state_dir),
+        "container": sb.container_name,
+    })
+    print(f"[provision] Instance '{sb.name}' provisioned.")
+
+
+def _start(sb: Sandbox, explicit_dockerfile: str = None):
+    """Start the sandbox container. Assumes _provision() has already run."""
+    if not sb.entrypoint_path.exists():
+        die(f"entrypoint.sh not found at {sb.entrypoint_path}. Was the instance provisioned?")
 
     proxy_url = f"http://{SQUID_CONTAINER_NAME}:{SQUID_PORT}"
     git_dir = sb.repo / ".git"
 
     docker_cmd = [
-        DOCKER,
-        "run",
-        "-d",
-        "-i",
-        "--name",
-        sb.container_name,
-        "--network",
-        NETWORK_NAME,
-        "-e",
-        f"http_proxy={proxy_url}",
-        "-e",
-        f"https_proxy={proxy_url}",
-        "-e",
-        f"HTTP_PROXY={proxy_url}",
-        "-e",
-        f"HTTPS_PROXY={proxy_url}",
-        "-e",
-        "no_proxy=localhost,127.0.0.1",
-        "-v",
-        f"{git_dir}:/repo-git:ro",
-        "-v",
-        f"{sb.workspace_dir}:/llm-workspace:rw",
-        "-v",
-        f"{entrypoint}:/entrypoint.sh:ro",
+        DOCKER, "run", "-d", "-i",
+        "--name", sb.container_name,
+        "--network", NETWORK_NAME,
+        "-e", f"http_proxy={proxy_url}",
+        "-e", f"https_proxy={proxy_url}",
+        "-e", f"HTTP_PROXY={proxy_url}",
+        "-e", f"HTTPS_PROXY={proxy_url}",
+        "-e", "no_proxy=localhost,127.0.0.1",
+        "-v", f"{git_dir}:/repo-git:ro",
+        "-v", f"{sb.workspace_dir}:/llm-workspace:rw",
+        "-v", f"{sb.entrypoint_path}:/entrypoint.sh:ro",
     ]
 
-    mount_bindings = []
-    state_root = sb.state_dir.resolve()
-    for rel_path, container_path in mounts.items():
+    for rel_path, container_path in load_mounts(sb).items():
         host_path = (sb.state_dir / rel_path).resolve()
-        try:
-            host_path.relative_to(state_root)
-        except ValueError:
+        if not host_path.is_relative_to(sb.state_dir.resolve()):
             print(f"WARNING: Skipping unsafe mount path '{rel_path}'")
             continue
-        mount_bindings.append((host_path, container_path))
+        host_path.mkdir(parents=True, exist_ok=True)
         docker_cmd.extend(["-v", f"{host_path}:{container_path}:rw"])
 
-    docker_cmd.extend(
-        [
-            "--entrypoint",
-            "/entrypoint.sh",
-            sb.image_tag,
-            "bash",
-        ]
-    )
+    docker_cmd.extend([
+        "--entrypoint", "/entrypoint.sh",
+        sb.image_tag,
+        "bash",
+    ])
 
-    return {
-        "needs_rebuild": needs_rebuild,
-        "image_hash": image_hash,
-        "dockerfile": dockerfile,
-        "dockerfile_seed_source": dockerfile_seed_source,
-        "mounts": mounts,
-        "mount_bindings": mount_bindings,
-        "docker_cmd": docker_cmd,
-        "proxy_url": proxy_url,
-    }
+    print(f"[container] Starting {sb.container_name} ...")
+    run(docker_cmd)  # raises CalledProcessError on failure
 
-
-def up(
-    sb: Sandbox, force_rebuild=False, no_cache=False, explicit_dockerfile: str = None
-):
-    print(f"\n=== sandbox up: {sb.name} ===\n")
-    try:
-        sb.config.prepare_instance_dir(explicit_dockerfile=explicit_dockerfile)
-        plan = plan_up(
-            sb, force_rebuild=force_rebuild, explicit_dockerfile=explicit_dockerfile
-        )
-    except (FileNotFoundError, ValueError) as e:
-        die(str(e))
-    config = sb.config
-    meta_existed_before = (sb.meta_dir / "meta.json").exists()
-    meta_before = sb.load_meta() if meta_existed_before else {}
-    rollback_stack = ExitStack()
-
-    def step(
-        name: str,
-        run_step: Callable[[], object],
-        rollback: Callable[[], None] | None = None,
-        fatal=True,
-    ):
-        if rollback:
-
-            def safe_rollback(step_name=name, fn=rollback):
-                try:
-                    fn()
-                except Exception as e:
-                    print(f"[rollback] {step_name} failed: {e}")
-
-            rollback_stack.callback(safe_rollback)
-        try:
-            return run_step()
-        except Exception as e:
-            if not fatal:
-                print(f"WARNING: Non-fatal up step '{name}' failed: {e}")
-                return None
-            print("[up] Rolling back failed transaction ...")
-            rollback_stack.close()
-            raise
-
-    created_dirs: list[Path] = []
-    mounts_existed_before = config.mounts_file.exists()
-    mounts_before = config.mounts_file.read_text() if mounts_existed_before else None
-    entrypoint_existed_before = config.entrypoint_path.exists()
-    entrypoint_before = (
-        config.entrypoint_path.read_text() if entrypoint_existed_before else None
-    )
-    entrypoint_mode_before = (
-        config.entrypoint_path.stat().st_mode & 0o777
-        if entrypoint_existed_before
-        else None
-    )
-    default_dockerfile_existed_before = config.default_dockerfile_path.exists()
-
-    def ensure_created(path: Path):
-        if not path.exists():
-            path.mkdir(parents=True, exist_ok=True)
-            created_dirs.append(path)
-
-    def restore_file(
-        path: Path, existed: bool, content: str | None, mode: int | None = None
-    ):
-        if existed:
-            path.write_text(content if content is not None else "")
-            if mode is not None:
-                path.chmod(mode)
-        elif path.exists():
-            path.unlink()
-
-    def prepare_local_state():
-        for path in (sb.meta_dir, sb.workspace_dir, sb.state_dir):
-            ensure_created(path)
-        if meta_existed_before:
-            config.require_managed_file(config.entrypoint_path, "entrypoint").chmod(0o755)
-            return
-        config.ensure_mounts_file()
-        config.ensure_default_dockerfile(seed_source=plan["dockerfile_seed_source"])
-        config.ensure_entrypoint()
-        config.ensure_triggers_file()
-
-    def rollback_prepare_local_state():
-        _restore_meta_snapshot(sb, meta_existed_before, meta_before)
-        restore_file(
-            config.entrypoint_path,
-            entrypoint_existed_before,
-            entrypoint_before,
-            entrypoint_mode_before,
-        )
-        restore_file(config.mounts_file, mounts_existed_before, mounts_before)
-        if (
-            not default_dockerfile_existed_before
-            and config.default_dockerfile_path.exists()
-        ):
-            config.default_dockerfile_path.unlink()
-        for path in reversed(created_dirs):
-            if path.exists():
-                shutil.rmtree(path)
-
-    def ensure_shared_infra():
-        ensure_network()
-        ensure_squid(load_global_allowlist())
-
-    def build_image_if_needed():
-        if not plan["needs_rebuild"]:
-            return
-        build_image(
-            sb, plan["image_hash"], no_cache=no_cache, dockerfile=plan["dockerfile"]
-        )
-        sb.update_meta({"image_hash": plan["image_hash"]})
-
-    started_container_this_run = False
-
-    def start_container():
-        nonlocal started_container_this_run
-        if container_running(sb.container_name):
-            print(f"[container] {sb.container_name} is already running.")
-            if sb.profile_explicit:
-                print(
-                    "[profile] Existing generated config is preserved; recreate or reset files to reseed from profile."
-                )
-        else:
-            if container_exists(sb.container_name):
-                print(f"[container] Removing stopped container {sb.container_name} ...")
-                run([DOCKER, "rm", sb.container_name], check=False, capture=True)
-            for host_path, _ in plan["mount_bindings"]:
-                host_path.mkdir(parents=True, exist_ok=True)
-            print(f"[container] Starting {sb.container_name} ...")
-            run(plan["docker_cmd"])
-            started_container_this_run = True
-        if not container_running(sb.container_name):
-            raise RuntimeError(f"{sb.container_name} is not running after start.")
-
-    def rollback_started_container():
-        if started_container_this_run and container_exists(sb.container_name):
-            print(f"[rollback] Removing container {sb.container_name} ...")
-            run([DOCKER, "rm", "-f", sb.container_name], check=False, capture=True)
-
-    def persist_runtime_meta():
-        sb.update_meta(
-            {
-                "sandbox_name": sb.name,
-                "repo": str(sb.repo),
-                "workspace_dir": str(sb.workspace_dir),
-                "state_dir": str(sb.state_dir),
-                "container": sb.container_name,
-            }
-        )
-
-    step(
-        "prepare_local_state",
-        prepare_local_state,
-        rollback=rollback_prepare_local_state,
-    )
-    step("ensure_shared_infra", ensure_shared_infra)
-    step("build_image_if_needed", build_image_if_needed)
-    step("start_container", start_container, rollback=rollback_started_container)
-    step("persist_runtime_meta", persist_runtime_meta)
-    rollback_stack.pop_all()
     print(f"\n[container] {sb.container_name} is up.")
     print(f"  Workspace : {sb.workspace_dir}")
     print(f"  State     : {sb.state_dir}")
-    print(f"  Proxy     : {plan['proxy_url']}")
-    # Post-commit: helpful, but does not affect successful `up`.
-    clone_ready = step("wait_for_clone", lambda: wait_for_clone(sb), fatal=False)
-    if clone_ready:
-        step("setup_git_remotes", lambda: setup_git_remotes(sb), fatal=False)
+    print(f"  Proxy     : {proxy_url}")
+
+    if wait_for_clone(sb):
+        setup_git_remotes(sb)
+
     print(f"\n  Attach with: {Path(sys.argv[0]).name} exec --name {sb.name}")
-    print(
-        f"  Or directly: {DOCKER} exec -it -w /llm-workspace {sb.container_name} bash\n"
-    )
+    print(f"  Or directly: {DOCKER} exec -it -w /llm-workspace {sb.container_name} bash\n")
 
 
 def down(sb: Sandbox):
     if container_running(sb.container_name):
         print(f"[container] Stopping {sb.container_name} (volumes preserved) ...")
-        # WARNING: -t 0 sends SIGKILL immediately, skipping graceful shutdown.
         run([DOCKER, "stop", "-t", "0", sb.container_name], check=False)
         run([DOCKER, "rm", sb.container_name], check=False, capture=True)
     elif container_exists(sb.container_name):
@@ -990,21 +696,13 @@ def down(sb: Sandbox):
         print(f"[container] {sb.container_name} not found.")
 
 
-def destroy(sb: Sandbox, remove_volumes=False):
-    meta = sb.load_meta()
+def destroy(sb: Sandbox):
+    """Remove all cheap/dangling resources. Workspace and state dirs are left intact."""
     down(sb)
     if image_exists(sb.image_tag):
         print(f"[image] Removing {sb.image_tag} ...")
         run([DOCKER, "rmi", sb.image_tag], check=False)
 
-    if remove_volumes:
-        for key in ("workspace_dir", "state_dir"):
-            p = Path(meta[key]) if key in meta else None
-            if p and p.exists():
-                print(f"[volumes] Removing {p} ...")
-                shutil.rmtree(p)
-
-    # Remove the agent remote from the host repo if it exists
     remote_name = f"agent-{sb.name}"
     r = run(["git", "-C", str(sb.repo), "remote"], capture=True, check=False)
     if remote_name in r.stdout.splitlines():
@@ -1015,23 +713,19 @@ def destroy(sb: Sandbox, remove_volumes=False):
         shutil.rmtree(sb.meta_dir)
 
     print(f"[destroy] {sb.name} destroyed.")
+    print(f"  Workspace and state preserved — remove manually if needed:")
+    print(f"    rm -rf {sb.workspace_dir} {sb.state_dir}")
 
 
 def infra_down():
-    """Stop and remove the shared squid container and sandbox-net network."""
     errors = False
 
     if container_exists(SQUID_CONTAINER_NAME):
         print(f"[infra] Removing {SQUID_CONTAINER_NAME} ...")
-        # stop first to be nice, then rm -f to be sure
-        run(
-            [DOCKER, "stop", "-t", "0", SQUID_CONTAINER_NAME], check=False, capture=True
-        )
+        run([DOCKER, "stop", "-t", "0", SQUID_CONTAINER_NAME], check=False, capture=True)
         r = run([DOCKER, "rm", "-f", SQUID_CONTAINER_NAME], check=False, capture=True)
         if r.returncode != 0:
-            print(
-                f"ERROR: Could not remove container {SQUID_CONTAINER_NAME}: {r.stderr.strip()}"
-            )
+            print(f"ERROR: Could not remove container {SQUID_CONTAINER_NAME}: {r.stderr.strip()}")
             errors = True
 
     if network_exists(NETWORK_NAME):
@@ -1049,13 +743,7 @@ def infra_down():
 
 
 def status():
-    """Show status of infrastructure and all known sandboxes."""
-    # 1. Fetch container states in bulk to avoid jitter
-    r = run(
-        [DOCKER, "ps", "-a", "--format", "{{.Names}} {{.State}}"],
-        capture=True,
-        check=False,
-    )
+    r = run([DOCKER, "ps", "-a", "--format", "{{.Names}} {{.State}}"], capture=True, check=False)
     c_states = {}
     for line in r.stdout.strip().splitlines():
         parts = line.split(None, 1)
@@ -1085,11 +773,9 @@ def status():
                 repo_str = meta.get("repo", "Unknown")
                 repo_p = Path(repo_str) if repo_str != "Unknown" else None
 
-                # Determine status
                 container_name = f"sandbox-{name}"
                 state = c_states.get(container_name, "no container")
 
-                # Determine Dockerfile origin
                 repo_df = repo_p / SANDBOX_DOCKERFILE_NAME if repo_p else None
                 fallback_df = d / "Dockerfile"
                 if repo_df and repo_df.exists():
@@ -1105,18 +791,9 @@ def status():
                 print(f"    Dockerfile: {df_info}")
                 print()
 
-    # Flag orphaned workspace dirs (no matching meta entry)
     if WORKSPACES_DIR.exists():
-        known_names = (
-            {d.name for d in INSTANCES_DIR.iterdir()}
-            if INSTANCES_DIR.exists()
-            else set()
-        )
-        orphans = [
-            d
-            for d in WORKSPACES_DIR.iterdir()
-            if d.is_dir() and d.name not in known_names
-        ]
+        known_names = {d.name for d in INSTANCES_DIR.iterdir()} if INSTANCES_DIR.exists() else set()
+        orphans = [d for d in WORKSPACES_DIR.iterdir() if d.is_dir() and d.name not in known_names]
         if orphans:
             print("=== Orphans (Workspaces without metadata) ===")
             for o in orphans:
@@ -1125,23 +802,19 @@ def status():
 
 
 def edit_dockerfile(sb: Sandbox):
-    config = sb.config
-    dockerfile = config.default_dockerfile_path
+    dockerfile = resolve_dockerfile(sb)
 
     if edit_file(dockerfile):
         print("[ed] Dockerfile changed, rebuilding ...")
         was_running = container_running(sb.container_name)
         try:
             _, new_hash = image_needs_rebuild(sb, force=True)
-            build_image(sb, new_hash, dockerfile=dockerfile)
+            build_image(sb, new_hash)
             sb.update_meta({"image_hash": new_hash})
         except Exception as e:
             print(f"[ed] Build failed: {e}")
-            print(
-                f"[ed] Container left {'running' if was_running else 'stopped'} — no restart."
-            )
+            print(f"[ed] Container left {'running' if was_running else 'stopped'} — no restart.")
             return
-        # Build succeeded — restart if it was running
         if was_running:
             print(f"[ed] Restarting {sb.container_name} ...")
             down(sb)
@@ -1151,30 +824,23 @@ def edit_dockerfile(sb: Sandbox):
 
 
 def edit_mounts(sb: Sandbox):
-    """Open $EDITOR on the mounts manifest, validate JSON, and restart sandbox if running."""
-    config = sb.config
-    if (sb.meta_dir / "meta.json").exists():
-        try:
-            config.require_managed_file(config.mounts_file, "mounts manifest")
-        except (FileNotFoundError, ValueError) as e:
-            die(str(e))
-    config.ensure_mounts_file()
+    if not sb.mounts_file.exists():
+        profile = sb.profile or copy.deepcopy(DEFAULT_PROFILE)
+        sb.mounts_file.write_text(json.dumps(profile["mounts"], indent=2))
+        print(f"[mounts] No manifest found — wrote default to {sb.mounts_file}")
 
-    if not edit_file(config.mounts_file):
+    if not edit_file(sb.mounts_file):
         print("[mounts] No changes.")
         return
 
-    # Validate JSON + schema
     try:
-        _parse_mounts(json.loads(config.mounts_file.read_text()), str(config.mounts_file))
-    except (json.JSONDecodeError, ValueError) as e:
-        die(f"Invalid mounts manifest: {e}")
+        json.loads(sb.mounts_file.read_text())
+    except json.JSONDecodeError as e:
+        die(f"Invalid JSON in mounts file: {e}")
 
     print("[mounts] Manifest updated.")
     if container_running(sb.container_name):
-        resp = input(
-            f"Restart {sb.container_name} now to apply changes? [y/N] "
-        ).lower()
+        resp = input(f"Restart {sb.container_name} now to apply changes? [y/N] ").lower()
         if resp == "y":
             down(sb)
             up(sb)
@@ -1182,19 +848,14 @@ def edit_mounts(sb: Sandbox):
 
 def exec_cmd(sb: Sandbox, cmd: list[str]):
     if not container_running(sb.container_name):
-        die(
-            f"{sb.container_name} is not running. Run `sandbox.py up --name {sb.name}` first."
-        )
+        die(f"{sb.container_name} is not running. Run `sandbox.py up --name {sb.name}` first.")
     cmd = cmd or ["bash"]
-    os.execvp(
-        DOCKER, [DOCKER, "exec", "-it", "-w", "/llm-workspace", sb.container_name] + cmd
-    )
+    os.execvp(DOCKER, [DOCKER, "exec", "-it", "-w", "/llm-workspace", sb.container_name] + cmd)
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
-
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -1205,79 +866,31 @@ def parse_args():
     parser.add_argument("--docker", metavar="BIN", help="Override docker/podman binary")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    # up
     p_up = sub.add_parser("up", help="Create/start sandbox (idempotent)")
-    p_up.add_argument(
-        "--name",
-        "-n",
-        default=_REPO_DEFAULT,
-        help="Sandbox name (default: repo directory name)",
-    )
-    p_up.add_argument(
-        "--repo", "-r", default=None, help="Repo path (default: git root of cwd)"
-    )
-    p_up.add_argument(
-        "--profile",
-        default=None,
-        metavar="DIR",
-        help="Profile directory with optional Dockerfile, mounts.json, rebuild_triggers.txt, entrypoint.sh",
-    )
-    p_up.add_argument("--rebuild", action="store_true", help="Force image rebuild")
-    p_up.add_argument(
-        "--no-cache",
-        dest="no_cache",
-        action="store_true",
-        help="Pass --no-cache to docker build (implies --rebuild)",
-    )
-    p_up.add_argument(
-        "--dockerfile",
-        default=None,
-        metavar="PATH",
-        help="Explicit Dockerfile (overrides .sandbox-dockerfile and default)",
-    )
+    p_up.add_argument("--name", "-n", default=_REPO_DEFAULT)
+    p_up.add_argument("--repo", "-r", default=None)
+    p_up.add_argument("--profile", default=None, metavar="DIR")
+    p_up.add_argument("--rebuild", action="store_true")
+    p_up.add_argument("--no-cache", dest="no_cache", action="store_true")
+    p_up.add_argument("--dockerfile", default=None, metavar="PATH")
 
-    # down
     p_down = sub.add_parser("down", help="Stop sandbox container (keep volumes/image)")
     p_down.add_argument("--name", "-n", default=_REPO_DEFAULT)
 
-    # destroy
-    p_destroy = sub.add_parser("destroy", help="Remove container and image")
+    p_destroy = sub.add_parser("destroy", help="Remove container, image, and meta (preserves workspace/state)")
     p_destroy.add_argument("--name", "-n", default=_REPO_DEFAULT)
-    p_destroy.add_argument(
-        "--volumes",
-        action="store_true",
-        help="Also delete workspace and state directories",
-    )
 
-    # status
     sub.add_parser("status", help="Show all sandboxes and infrastructure")
-
-    # infra-down
     sub.add_parser("infra-down", help="Tear down shared squid container and network")
+    sub.add_parser("edit-allowlist", aliases=["ea"])
 
-    # edit-allowlist
-    sub.add_parser(
-        "edit-allowlist",
-        aliases=["ea"],
-        help="Edit global squid allowlist and reconfigure squid",
-    )
-
-    # edit-dockerfile
-    p_ed = sub.add_parser(
-        "edit-dockerfile", aliases=["ed"], help="Edit sandbox Dockerfile and rebuild"
-    )
+    p_ed = sub.add_parser("edit-dockerfile", aliases=["ed"])
     p_ed.add_argument("--name", "-n", default=_REPO_DEFAULT)
-    p_ed.add_argument(
-        "--dockerfile", default=None, metavar="PATH", help="Explicit Dockerfile to edit"
-    )
+    p_ed.add_argument("--dockerfile", default=None, metavar="PATH")
 
-    # edit-mounts
-    p_em = sub.add_parser(
-        "edit-mounts", aliases=["em"], help="Edit state directory mounts"
-    )
+    p_em = sub.add_parser("edit-mounts", aliases=["em"])
     p_em.add_argument("--name", "-n", default=_REPO_DEFAULT)
 
-    # exec
     p_exec = sub.add_parser("exec", help="Exec into running sandbox")
     p_exec.add_argument("--name", "-n", default=_REPO_DEFAULT)
     p_exec.add_argument("cmd", nargs="*", default=["bash"])
@@ -1296,22 +909,16 @@ def main():
 
     if args.command == "up":
         sb = resolve_sandbox(args)
-        sb.profile = (
-            load_profile(Path(args.profile)) if args.profile else load_profile(None)
-        )
+        sb.profile = load_profile(Path(args.profile)) if args.profile else load_profile(None)
         sb.profile_explicit = bool(args.profile)
-        up(
-            sb,
-            force_rebuild=args.rebuild or args.no_cache,
-            no_cache=args.no_cache,
-            explicit_dockerfile=args.dockerfile,
-        )
+        up(sb, force_rebuild=args.rebuild or args.no_cache, no_cache=args.no_cache,
+           explicit_dockerfile=args.dockerfile)
     elif args.command == "down":
         sb = resolve_sandbox(args)
         down(sb)
     elif args.command == "destroy":
         sb = resolve_sandbox(args)
-        destroy(sb, remove_volumes=args.volumes)
+        destroy(sb)
     elif args.command == "status":
         status()
     elif args.command == "infra-down":
