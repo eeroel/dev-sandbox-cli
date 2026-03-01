@@ -8,9 +8,6 @@ Default sandbox name is derived from the repo directory name.
 TODO:
   - BUG: `edit-mounts` validates JSON syntax only; invalid mount schema (not str->str)
     is accepted at edit time and only handled later with runtime fallback.
-  - BUG: `--profile` is intended as a one-time blueprint, but `up --profile` currently
-    reapplies generated config (e.g. mounts) on later runs; generated-file lifecycle is
-    inconsistent and should be "seed once unless explicitly reset."
   - Add `--pull` flag to `up` to refresh the base image before rebuilding (for OS/base updates)
   - Orphaned volume dirs in workspaces flagged in `status` but not cleaned automatically;
     consider an `sandbox.py prune` command
@@ -323,14 +320,14 @@ class SandboxConfig:
         return self.ensure_default_dockerfile()
 
     def ensure_entrypoint(self) -> Path:
-        """Write entrypoint script every run so template changes are picked up."""
+        """Write default entrypoint script only if missing."""
         script = self.profile["entrypoint_script"]
         self.entrypoint_path.parent.mkdir(parents=True, exist_ok=True)
-        previous = (
-            self.entrypoint_path.read_text() if self.entrypoint_path.exists() else None
-        )
-        if previous != script:
+        if not self.entrypoint_path.exists():
             self.entrypoint_path.write_text(script)
+            print(
+                f"[entrypoint] No script found — wrote default to {self.entrypoint_path}"
+            )
         self.entrypoint_path.chmod(0o755)
         return self.entrypoint_path
 
@@ -703,8 +700,8 @@ def plan_up(sb: Sandbox, force_rebuild=False, explicit_dockerfile: str = None) -
         dockerfile = config.default_dockerfile_path
         needs_default_dockerfile = not dockerfile.exists()
 
-    # `up --profile` applies profile mounts to the generated manifest for this run.
-    mounts = config.profile["mounts"] if sb.profile_explicit else config.load_mounts()
+    # Generated mounts are seed-once; if a manifest exists, always honor it.
+    mounts = config.load_mounts()
 
     proxy_url = f"http://{SQUID_CONTAINER_NAME}:{SQUID_PORT}"
     git_dir = sb.repo / ".git"
@@ -840,9 +837,6 @@ def up(
         for path in (sb.meta_dir, sb.workspace_dir, sb.state_dir):
             ensure_created(path)
         config.ensure_mounts_file()
-        if sb.profile_explicit:
-            config.mounts_file.write_text(json.dumps(plan["mounts"], indent=2))
-            print(f"[mounts] Applied profile mounts to {config.mounts_file}")
         if plan["needs_default_dockerfile"]:
             config.ensure_default_dockerfile()
         config.ensure_entrypoint()
@@ -885,7 +879,7 @@ def up(
             print(f"[container] {sb.container_name} is already running.")
             if sb.profile_explicit:
                 print(
-                    "[profile] Container is already running; profile mounts are not applied until recreate (down + up)."
+                    "[profile] Existing generated config is preserved; recreate or reset files to reseed from profile."
                 )
         else:
             if container_exists(sb.container_name):
