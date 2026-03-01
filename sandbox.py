@@ -46,7 +46,7 @@ DEFAULT_ALLOWLIST = [
 ]
 
 DOCKER = shutil.which("podman") or shutil.which("docker")
-SANDBOX_DOCKERFILE_NAME = ".sandbox-dockerfile"  # repo-level override
+
 
 DEFAULT_PROFILE = {
     "dockerfile": """\
@@ -68,7 +68,6 @@ CMD ["bash"]
         # ".config": "/root/.config"
     },
     "rebuild_triggers": [
-        ".sandbox-dockerfile",
         "uv.lock",
         "pyproject.toml",
         "requirements.txt",
@@ -194,10 +193,6 @@ class Sandbox:
         return self.meta_dir / "Dockerfile"
 
     @property
-    def repo_dockerfile_path(self) -> Path:
-        return self.repo / SANDBOX_DOCKERFILE_NAME
-
-    @property
     def mounts_file(self) -> Path:
         return self.meta_dir / "mounts.json"
 
@@ -240,21 +235,16 @@ class Sandbox:
 # ---------------------------------------------------------------------------
 
 def resolve_dockerfile(sb: Sandbox, explicit_dockerfile: str = None) -> Path:
-    """Resolve Dockerfile path: explicit > repo override > seeded default."""
+    """Resolve Dockerfile: explicit path if given, otherwise the seeded instance default."""
     if explicit_dockerfile:
         p = Path(explicit_dockerfile).resolve()
         if not p.exists():
             raise FileNotFoundError(f"--dockerfile not found: {p}")
         return p
-    if sb.repo_dockerfile_path.exists():
-        return sb.repo_dockerfile_path
-    # Fall back to seeded default, writing it if this is somehow missing.
     if not sb.dockerfile_path.exists():
         profile = sb.profile or copy.deepcopy(DEFAULT_PROFILE)
         sb.dockerfile_path.write_text(profile["dockerfile"])
-        print(f"[image] No repo Dockerfile found — wrote default to {sb.dockerfile_path}")
-    else:
-        print(f"[image] No repo Dockerfile found — using existing default at {sb.dockerfile_path}")
+        print(f"[image] Wrote default Dockerfile to {sb.dockerfile_path}")
     return sb.dockerfile_path
 
 
@@ -616,9 +606,8 @@ def _provision(sb: Sandbox):
     sb.mounts_file.write_text(json.dumps(profile["mounts"], indent=2))
     print(f"[provision] Wrote {sb.mounts_file}")
 
-    if not sb.repo_dockerfile_path.exists():
-        sb.dockerfile_path.write_text(profile["dockerfile"])
-        print(f"[provision] Wrote {sb.dockerfile_path}")
+    sb.dockerfile_path.write_text(profile["dockerfile"])
+    print(f"[provision] Wrote {sb.dockerfile_path}")
 
     sb.entrypoint_path.write_text(profile["entrypoint_script"])
     sb.entrypoint_path.chmod(0o755)
@@ -771,19 +760,12 @@ def status():
                 meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
 
                 repo_str = meta.get("repo", "Unknown")
-                repo_p = Path(repo_str) if repo_str != "Unknown" else None
 
                 container_name = f"sandbox-{name}"
                 state = c_states.get(container_name, "no container")
 
-                repo_df = repo_p / SANDBOX_DOCKERFILE_NAME if repo_p else None
-                fallback_df = d / "Dockerfile"
-                if repo_df and repo_df.exists():
-                    df_info = f"{repo_df} (repo override)"
-                elif fallback_df.exists():
-                    df_info = f"{fallback_df} (default)"
-                else:
-                    df_info = "None found"
+                df = d / "Dockerfile"
+                df_info = str(df) if df.exists() else "None found"
 
                 print(f"  Sandbox: {name}")
                 print(f"    State     : {state}")
