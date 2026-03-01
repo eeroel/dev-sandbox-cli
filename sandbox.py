@@ -12,6 +12,14 @@ TODO:
   - On `up`, add cli prompt to set git username and email. Default to values from repo, but allow changing them.
   - Warn or error on `up` if the same --name is reused across different repos
     (currently only catches this if meta already exists)
+
+YAGNI / worth revisiting:
+  - The allowlist editor (edit-allowlist / reconfigure_squid / write_squid_conf) is ~80 lines for
+    a feature that might never be used if the proxy is always deny-all or always the same config.
+    Could be replaced with "just edit ~/.sandbox/squid/squid.conf and restart squid manually".
+  - Profile files (config.json, Dockerfile, entrypoint.sh) — mounts and rebuild_triggers
+    are now unified in config.json; Dockerfile and entrypoint.sh remain separate files as
+    they are non-JSON and benefit from syntax highlighting / direct editing.
 """
 
 import argparse
@@ -101,29 +109,14 @@ exec "$@"
 }
 
 
-def _parse_mounts(data: object, source: str) -> dict[str, str]:
-    if not isinstance(data, dict):
-        raise ValueError(f"{source} must contain a JSON object mapping host-relative paths to container paths.")
-    parsed = {}
-    for k, v in data.items():
-        if not isinstance(k, str) or not isinstance(v, str):
-            raise ValueError(f"{source} must map string keys to string values.")
-        parsed[k] = v
-    return parsed
-
-
-def _load_rebuild_triggers(path: Path) -> list[str]:
-    triggers = []
-    for line in path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        triggers.append(line)
-    return triggers
-
-
 def load_profile(profile_dir: Path | None) -> dict:
-    """Load profile config for `up`. If profile_dir is None, return defaults."""
+    """Load profile config for `up`. If profile_dir is None, return defaults.
+
+    A profile directory may contain:
+      config.json   — optional, keys: mounts (object), rebuild_triggers (array)
+      Dockerfile    — optional, replaces the default image definition
+      entrypoint.sh — optional, replaces the default container entrypoint
+    """
     profile = copy.deepcopy(DEFAULT_PROFILE)
     if profile_dir is None:
         return profile
@@ -134,20 +127,26 @@ def load_profile(profile_dir: Path | None) -> dict:
     if not profile_dir.is_dir():
         die(f"--profile must point to a directory: {profile_dir}")
 
-    mounts_path = profile_dir / "mounts.json"
-    dockerfile_path = profile_dir / "Dockerfile"
-    triggers_path = profile_dir / "rebuild_triggers.txt"
-    entrypoint_path = profile_dir / "entrypoint.sh"
-
-    if mounts_path.exists():
+    config_path = profile_dir / "config.json"
+    if config_path.exists():
         try:
-            profile["mounts"] = _parse_mounts(json.loads(mounts_path.read_text()), str(mounts_path))
-        except (json.JSONDecodeError, ValueError) as e:
-            die(f"Invalid JSON in {mounts_path}: {e}")
+            cfg = json.loads(config_path.read_text())
+        except json.JSONDecodeError as e:
+            die(f"Invalid JSON in {config_path}: {e}")
+        if "mounts" in cfg:
+            if not isinstance(cfg["mounts"], dict):
+                die(f"{config_path}: 'mounts' must be a JSON object")
+            profile["mounts"] = cfg["mounts"]
+        if "rebuild_triggers" in cfg:
+            if not isinstance(cfg["rebuild_triggers"], list):
+                die(f"{config_path}: 'rebuild_triggers' must be a JSON array")
+            profile["rebuild_triggers"] = cfg["rebuild_triggers"]
+
+    dockerfile_path = profile_dir / "Dockerfile"
     if dockerfile_path.exists():
         profile["dockerfile"] = dockerfile_path.read_text()
-    if triggers_path.exists():
-        profile["rebuild_triggers"] = _load_rebuild_triggers(triggers_path)
+
+    entrypoint_path = profile_dir / "entrypoint.sh"
     if entrypoint_path.exists():
         profile["entrypoint_script"] = entrypoint_path.read_text()
 
@@ -193,8 +192,8 @@ class Sandbox:
         return self.meta_dir / "Dockerfile"
 
     @property
-    def mounts_file(self) -> Path:
-        return self.meta_dir / "mounts.json"
+    def config_file(self) -> Path:
+        return self.meta_dir / "config.json"
 
     @property
     def entrypoint_path(self) -> Path:
@@ -249,12 +248,14 @@ def resolve_dockerfile(sb: Sandbox, explicit_dockerfile: str = None) -> Path:
 
 
 def load_mounts(sb: Sandbox) -> dict:
-    """Load mount mappings from seeded mounts.json. Falls back to profile defaults."""
-    if sb.mounts_file.exists():
+    """Load mount mappings from seeded config.json. Falls back to profile defaults."""
+    if sb.config_file.exists():
         try:
-            return _parse_mounts(json.loads(sb.mounts_file.read_text()), str(sb.mounts_file))
-        except (json.JSONDecodeError, ValueError):
-            print(f"WARNING: Malformed {sb.mounts_file}. Using defaults.")
+            cfg = json.loads(sb.config_file.read_text())
+            if "mounts" in cfg:
+                return cfg["mounts"]
+        except json.JSONDecodeError:
+            print(f"WARNING: Malformed {sb.config_file}. Using defaults.")
     profile = sb.profile or copy.deepcopy(DEFAULT_PROFILE)
     return profile["mounts"]
 
@@ -475,11 +476,18 @@ def image_needs_rebuild(sb: Sandbox, force: bool) -> tuple[bool, str]:
     """Pure read: check whether the image needs to be rebuilt.
 
     Hashes repo trigger files AND the seeded Dockerfile so that manual edits
-    to it are reflected on the next `up`. mounts.json is excluded — mounts are
+    to it are reflected on the next `up`. config.json is excluded — mounts are
     a runtime concern (passed as -v flags) with no bearing on image contents.
     """
     profile = sb.profile or DEFAULT_PROFILE
-    trigger_files = [sb.repo / f for f in profile["rebuild_triggers"]]
+    triggers = profile["rebuild_triggers"]
+    if sb.config_file.exists():
+        try:
+            cfg = json.loads(sb.config_file.read_text())
+            triggers = cfg.get("rebuild_triggers", triggers)
+        except json.JSONDecodeError:
+            pass
+    trigger_files = [sb.repo / f for f in triggers]
     # Include the seeded Dockerfile so manual edits automatically trigger a rebuild.
     instance_files = [sb.dockerfile_path]
     current_hash = hash_files(trigger_files + instance_files)
@@ -603,8 +611,9 @@ def _provision(sb: Sandbox):
     sb.workspace_dir.mkdir(parents=True, exist_ok=True)
     sb.state_dir.mkdir(parents=True, exist_ok=True)
 
-    sb.mounts_file.write_text(json.dumps(profile["mounts"], indent=2))
-    print(f"[provision] Wrote {sb.mounts_file}")
+    config_data = {"mounts": profile["mounts"], "rebuild_triggers": profile["rebuild_triggers"]}
+    sb.config_file.write_text(json.dumps(config_data, indent=2))
+    print(f"[provision] Wrote {sb.config_file}")
 
     sb.dockerfile_path.write_text(profile["dockerfile"])
     print(f"[provision] Wrote {sb.dockerfile_path}")
@@ -806,21 +815,22 @@ def edit_dockerfile(sb: Sandbox):
 
 
 def edit_mounts(sb: Sandbox):
-    if not sb.mounts_file.exists():
+    if not sb.config_file.exists():
         profile = sb.profile or copy.deepcopy(DEFAULT_PROFILE)
-        sb.mounts_file.write_text(json.dumps(profile["mounts"], indent=2))
-        print(f"[mounts] No manifest found — wrote default to {sb.mounts_file}")
+        cfg = {"mounts": profile["mounts"], "rebuild_triggers": profile["rebuild_triggers"]}
+        sb.config_file.write_text(json.dumps(cfg, indent=2))
+        print(f"[mounts] No config found — wrote default to {sb.config_file}")
 
-    if not edit_file(sb.mounts_file):
+    if not edit_file(sb.config_file):
         print("[mounts] No changes.")
         return
 
     try:
-        json.loads(sb.mounts_file.read_text())
+        json.loads(sb.config_file.read_text())
     except json.JSONDecodeError as e:
-        die(f"Invalid JSON in mounts file: {e}")
+        die(f"Invalid JSON in {sb.config_file}: {e}")
 
-    print("[mounts] Manifest updated.")
+    print("[mounts] Config updated.")
     if container_running(sb.container_name):
         resp = input(f"Restart {sb.container_name} now to apply changes? [y/N] ").lower()
         if resp == "y":

@@ -1,8 +1,0 @@
-.sandbox-dockerfile
-uv.lock
-pyproject.toml
-requirements.txt
-requirements-dev.txt
-package.json
-package-lock.json
-yarn.lock
