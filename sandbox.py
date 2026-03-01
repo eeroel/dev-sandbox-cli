@@ -2,17 +2,6 @@
 """
 sandbox.py — Dev sandbox container manager (podman/docker, docker-compose-free)
 
-Usage:
-    sandbox.py up [--name NAME] [--repo PATH] [--profile DIR] [--rebuild] [--no-cache]
-    sandbox.py down [--name NAME]
-    sandbox.py destroy [--name NAME] [--volumes]
-    sandbox.py status
-    sandbox.py exec [--name NAME] [CMD...]
-    sandbox.py edit-allowlist
-    sandbox.py edit-dockerfile [--name NAME]
-    sandbox.py edit-mounts [--name NAME]
-    sandbox.py infra-down
-
 All infrastructure (network, squid proxy) is created if not present — idempotent.
 Default sandbox name is derived from the repo directory name.
 
@@ -23,6 +12,9 @@ TODO:
     earlier failures can leave ghost instance metadata directories.
   - BUG: `edit-mounts` validates JSON syntax only; invalid mount schema (not str->str)
     is accepted at edit time and only handled later with runtime fallback.
+  - BUG: `--profile` is intended as a one-time blueprint, but `up --profile` currently
+    reapplies generated config (e.g. mounts) on later runs; generated-file lifecycle is
+    inconsistent and should be "seed once unless explicitly reset."
   - Add `--pull` flag to `up` to refresh the base image before rebuilding (for OS/base updates)
   - Orphaned volume dirs in workspaces flagged in `status` but not cleaned automatically;
     consider an `sandbox.py prune` command
@@ -233,6 +225,12 @@ class Sandbox:
             except OSError:
                 pass
             raise
+
+    def update_meta(self, patch: dict):
+        """Merge keys into meta.json atomically."""
+        meta = self.load_meta()
+        meta.update(patch)
+        self.save_meta(meta)
 
     # --- Alternative constructors ------------------------------------------
 
@@ -568,8 +566,8 @@ def image_needs_rebuild(sb: Sandbox, force: bool) -> tuple[bool, str]:
 
 
 def build_image(sb: Sandbox, current_hash: str, no_cache=False, explicit_dockerfile: str = None) -> None:
-    """Unconditionally build the image and write the new hash to meta on success.
-    Raises CalledProcessError on build failure (meta is not updated)."""
+    """Unconditionally build the image.
+    Raises CalledProcessError on build failure."""
     dockerfile = sb.config.resolve_dockerfile(explicit_dockerfile=explicit_dockerfile)
 
     print(f"[image] Building {sb.image_tag} (trigger hash: {current_hash}){' [no-cache]' if no_cache else ''} ...")
@@ -579,11 +577,6 @@ def build_image(sb: Sandbox, current_hash: str, no_cache=False, explicit_dockerf
         cmd.append("--no-cache")
     cmd.append(str(sb.repo))
     run(cmd)  # raises CalledProcessError on failure
-
-    # Build succeeded — persist the new hash
-    meta = sb.load_meta()
-    meta["image_hash"] = current_hash
-    sb.save_meta(meta)
 
 
 # ---------------------------------------------------------------------------
@@ -645,10 +638,11 @@ def up(sb: Sandbox, force_rebuild=False, no_cache=False, explicit_dockerfile: st
     # Infrastructure (shared, long-lived — always safe to create)
     ensure_network()
     ensure_squid(load_global_allowlist())
-    # Build image — may raise; image_needs_rebuild is a pure read, build_image writes hash on success
+    # Build image — may raise; image_needs_rebuild is a pure read.
     needs_rebuild, image_hash = image_needs_rebuild(sb, force=force_rebuild)
     if needs_rebuild:
         build_image(sb, image_hash, no_cache=no_cache, explicit_dockerfile=explicit_dockerfile)
+        sb.update_meta({"image_hash": image_hash})
 
     if container_running(sb.container_name):
         print(f"[container] {sb.container_name} is already running.")
@@ -718,17 +712,14 @@ def up(sb: Sandbox, force_rebuild=False, no_cache=False, explicit_dockerfile: st
                 shutil.rmtree(sb.meta_dir)
         raise
 
-    # Container is confirmed up — persist remaining state. image_hash was already
-    # written by build_image on success, so load first to avoid overwriting it.
-    meta = sb.load_meta()
-    meta.update({
+    # Container is confirmed up — persist runtime state.
+    sb.update_meta({
         "sandbox_name": sb.name,
         "repo": str(sb.repo),
         "workspace_dir": str(sb.workspace_dir),
         "state_dir": str(sb.state_dir),
         "container": sb.container_name,
     })
-    sb.save_meta(meta)
 
     print(f"\n[container] {sb.container_name} is up.")
     print(f"  Workspace : {sb.workspace_dir}")
@@ -882,6 +873,7 @@ def edit_dockerfile(sb: Sandbox, explicit_dockerfile: str = None):
         try:
             _, new_hash = image_needs_rebuild(sb, force=True)
             build_image(sb, new_hash)
+            sb.update_meta({"image_hash": new_hash})
         except Exception as e:
             print(f"[ed] Build failed: {e}")
             print(f"[ed] Container left {'running' if was_running else 'stopped'} — no restart.")
@@ -1004,32 +996,24 @@ def main():
         sb.profile_explicit = bool(args.profile)
         up(sb, force_rebuild=args.rebuild or args.no_cache, no_cache=args.no_cache,
            explicit_dockerfile=args.dockerfile)
-
     elif args.command == "down":
         sb = resolve_sandbox(args)
         down(sb)
-
     elif args.command == "destroy":
         sb = resolve_sandbox(args)
         destroy(sb, remove_volumes=args.volumes)
-
     elif args.command == "status":
         status()
-
     elif args.command == "infra-down":
         infra_down()
-
     elif args.command in ("edit-allowlist", "ea"):
         edit_allowlist()
-
     elif args.command in ("edit-dockerfile", "ed"):
         sb = resolve_sandbox(args)
         edit_dockerfile(sb, explicit_dockerfile=getattr(args, "dockerfile", None))
-
     elif args.command in ("edit-mounts", "em"):
         sb = resolve_sandbox(args)
         edit_mounts(sb)
-
     elif args.command == "exec":
         sb = resolve_sandbox(args)
         exec_cmd(sb, args.cmd)
