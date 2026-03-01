@@ -3,7 +3,7 @@
 sandbox.py — Dev sandbox container manager (podman/docker, docker-compose-free)
 
 Usage:
-    sandbox.py up [--name NAME] [--repo PATH] [--rebuild] [--no-cache]
+    sandbox.py up [--name NAME] [--repo PATH] [--profile DIR] [--rebuild] [--no-cache]
     sandbox.py down [--name NAME]
     sandbox.py destroy [--name NAME] [--volumes]
     sandbox.py status
@@ -17,7 +17,6 @@ All infrastructure (network, squid proxy) is created if not present — idempote
 Default sandbox name is derived from the repo directory name.
 
 TODO:
-  - [depends on SandboxConfig] add "--profile" argument that takes a directory which supplies a SandboxConfig as files. Hardcode the default profile as JSON in this file (ie move all the relevant strings as fields to that one).
   - Add `--pull` flag to `up` to refresh the base image before rebuilding (for OS/base updates)
   - Orphaned volume dirs in workspaces flagged in `status` but not cleaned automatically;
     consider an `sandbox.py prune` command
@@ -27,6 +26,7 @@ TODO:
 """
 
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -57,8 +57,11 @@ SQUID_PORT = 3128
 DEFAULT_ALLOWLIST = [
 ]
 
-# Files that trigger an image rebuild when changed
-DEFAULT_DOCKERFILE = """\
+DOCKER = shutil.which("podman") or shutil.which("docker")
+SANDBOX_DOCKERFILE_NAME = ".sandbox-dockerfile"  # repo-level override
+
+DEFAULT_PROFILE = {
+    "dockerfile": """\
 FROM python:3.13-slim
 
 WORKDIR /workspace
@@ -70,29 +73,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \\
 RUN pip install --no-cache-dir uv ruff ty
 
 CMD ["bash"]
-"""
-
-# Default state mounts if none specified
-# Maps relative path in state_dir -> absolute path in container
-DEFAULT_MOUNTS = {
-    # example:
-    # ".config": "/root/.config"
-}
-
-REBUILD_TRIGGERS = [
-    ".sandbox-dockerfile",
-    "uv.lock",
-    "pyproject.toml",
-    "requirements.txt",
-    "requirements-dev.txt",
-    "package.json",
-    "package-lock.json",
-    "yarn.lock",
-]
-
-DOCKER = shutil.which("podman") or shutil.which("docker")
-SANDBOX_DOCKERFILE_NAME = ".sandbox-dockerfile"  # repo-level override
-ENTRYPOINT_TEMPLATE = """\
+""",
+    # Maps relative path in state_dir -> absolute path in container
+    "mounts": {
+        # example:
+        # ".config": "/root/.config"
+    },
+    "rebuild_triggers": [
+        ".sandbox-dockerfile",
+        "uv.lock",
+        "pyproject.toml",
+        "requirements.txt",
+        "requirements-dev.txt",
+        "package.json",
+        "package-lock.json",
+        "yarn.lock",
+    ],
+    "entrypoint_script": """\
 #!/bin/bash
 set -e
 
@@ -105,7 +102,7 @@ if [ ! -d "$WORKSPACE/.git" ]; then
     git clone --no-hardlinks "$GIT_MOUNT" "$WORKSPACE"
     cd "$WORKSPACE"
     git config user.email "agent@sandbox"
-    git config user.name "Agent ({sandbox_name})"
+    git config user.name "Agent"
 else
     echo "[sandbox] Workspace already cloned."
     cd "$WORKSPACE"
@@ -113,7 +110,61 @@ fi
 
 echo "[sandbox] Ready. Repo: $(git log --oneline -1 2>/dev/null || echo 'empty')"
 exec "$@"
-"""
+""",
+}
+
+
+def _parse_mounts(data: object, source: str) -> dict[str, str]:
+    if not isinstance(data, dict):
+        raise ValueError(f"{source} must contain a JSON object mapping host-relative paths to container paths.")
+    parsed = {}
+    for k, v in data.items():
+        if not isinstance(k, str) or not isinstance(v, str):
+            raise ValueError(f"{source} must map string keys to string values.")
+        parsed[k] = v
+    return parsed
+
+
+def _load_rebuild_triggers(path: Path) -> list[str]:
+    triggers = []
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        triggers.append(line)
+    return triggers
+
+
+def load_profile(profile_dir: Path | None) -> dict:
+    """Load profile config for `up`. If profile_dir is None, return defaults."""
+    profile = copy.deepcopy(DEFAULT_PROFILE)
+    if profile_dir is None:
+        return profile
+
+    profile_dir = profile_dir.resolve()
+    if not profile_dir.exists():
+        die(f"--profile directory not found: {profile_dir}")
+    if not profile_dir.is_dir():
+        die(f"--profile must point to a directory: {profile_dir}")
+
+    mounts_path = profile_dir / "mounts.json"
+    dockerfile_path = profile_dir / "Dockerfile"
+    triggers_path = profile_dir / "rebuild_triggers.txt"
+    entrypoint_path = profile_dir / "entrypoint.sh"
+
+    if mounts_path.exists():
+        try:
+            profile["mounts"] = _parse_mounts(json.loads(mounts_path.read_text()), str(mounts_path))
+        except (json.JSONDecodeError, ValueError) as e:
+            die(f"Invalid JSON in {mounts_path}: {e}")
+    if dockerfile_path.exists():
+        profile["dockerfile"] = dockerfile_path.read_text()
+    if triggers_path.exists():
+        profile["rebuild_triggers"] = _load_rebuild_triggers(triggers_path)
+    if entrypoint_path.exists():
+        profile["entrypoint_script"] = entrypoint_path.read_text()
+
+    return profile
 
 # ---------------------------------------------------------------------------
 # Sandbox dataclass
@@ -123,6 +174,8 @@ exec "$@"
 class Sandbox:
     name: str
     repo: Path
+    profile: dict | None = None
+    profile_explicit: bool = False
 
     # --- Path properties ---------------------------------------------------
 
@@ -152,7 +205,7 @@ class Sandbox:
 
     @property
     def config(self) -> "SandboxConfig":
-        return SandboxConfig(self)
+        return SandboxConfig(self, profile=self.profile or copy.deepcopy(DEFAULT_PROFILE))
 
     # --- Meta persistence --------------------------------------------------
 
@@ -209,6 +262,7 @@ class Sandbox:
 @dataclass
 class SandboxConfig:
     sandbox: Sandbox
+    profile: dict
 
     @property
     def mounts_file(self) -> Path:
@@ -230,7 +284,7 @@ class SandboxConfig:
         """Write default mounts.json if missing."""
         self.mounts_file.parent.mkdir(parents=True, exist_ok=True)
         if not self.mounts_file.exists():
-            self.mounts_file.write_text(json.dumps(DEFAULT_MOUNTS, indent=2))
+            self.mounts_file.write_text(json.dumps(self.profile["mounts"], indent=2))
             print(f"[mounts] No manifest found — wrote default to {self.mounts_file}")
         return self.mounts_file
 
@@ -238,16 +292,16 @@ class SandboxConfig:
         """Load mount mappings. Relative path -> Container path."""
         if self.mounts_file.exists():
             try:
-                return json.loads(self.mounts_file.read_text())
-            except json.JSONDecodeError:
+                return _parse_mounts(json.loads(self.mounts_file.read_text()), str(self.mounts_file))
+            except (json.JSONDecodeError, ValueError):
                 print(f"WARNING: Malformed {self.mounts_file}. Using defaults.")
-        return DEFAULT_MOUNTS
+        return self.profile["mounts"]
 
     def ensure_default_dockerfile(self) -> Path:
         """Write default Dockerfile if missing."""
         self.default_dockerfile_path.parent.mkdir(parents=True, exist_ok=True)
         if not self.default_dockerfile_path.exists():
-            self.default_dockerfile_path.write_text(DEFAULT_DOCKERFILE)
+            self.default_dockerfile_path.write_text(self.profile["dockerfile"])
             print(f"[image] No repo Dockerfile found — wrote default to {self.default_dockerfile_path}")
         else:
             print(f"[image] No repo Dockerfile found — using existing default at {self.default_dockerfile_path}")
@@ -266,7 +320,7 @@ class SandboxConfig:
 
     def ensure_entrypoint(self) -> Path:
         """Write entrypoint script every run so template changes are picked up."""
-        script = ENTRYPOINT_TEMPLATE.format(sandbox_name=self.sandbox.name)
+        script = self.profile["entrypoint_script"]
         self.entrypoint_path.parent.mkdir(parents=True, exist_ok=True)
         previous = self.entrypoint_path.read_text() if self.entrypoint_path.exists() else None
         if previous != script:
@@ -498,7 +552,7 @@ def edit_allowlist():
 def image_needs_rebuild(sb: Sandbox, force: bool) -> tuple[bool, str]:
     """Pure read: check whether the image needs to be rebuilt.
     Returns (needs_rebuild, current_hash). Does not modify any state."""
-    trigger_files = [sb.repo / f for f in REBUILD_TRIGGERS]
+    trigger_files = [sb.repo / f for f in sb.config.profile["rebuild_triggers"]]
     current_hash = hash_files(trigger_files)
 
     if force:
@@ -608,6 +662,8 @@ def up(sb: Sandbox, force_rebuild=False, no_cache=False, explicit_dockerfile: st
 
     if container_running(sb.container_name):
         print(f"[container] {sb.container_name} is already running.")
+        if sb.profile_explicit:
+            print("[profile] Container is already running; profile mounts are not applied until recreate (down + up).")
         setup_git_remotes(sb)
         return
 
@@ -620,6 +676,9 @@ def up(sb: Sandbox, force_rebuild=False, no_cache=False, explicit_dockerfile: st
     sb.state_dir.mkdir(parents=True, exist_ok=True)
     config = sb.config
     config.ensure_mounts_file()
+    if sb.profile_explicit:
+        config.mounts_file.write_text(json.dumps(config.profile["mounts"], indent=2))
+        print(f"[mounts] Applied profile mounts to {config.mounts_file}")
     entrypoint = config.ensure_entrypoint()
 
     proxy_url = f"http://{SQUID_CONTAINER_NAME}:{SQUID_PORT}"
@@ -903,6 +962,8 @@ def parse_args():
     p_up.add_argument("--name", "-n", default=_REPO_DEFAULT,
                       help="Sandbox name (default: repo directory name)")
     p_up.add_argument("--repo", "-r", default=None, help="Repo path (default: git root of cwd)")
+    p_up.add_argument("--profile", default=None, metavar="DIR",
+                      help="Profile directory with optional Dockerfile, mounts.json, rebuild_triggers.txt, entrypoint.sh")
     p_up.add_argument("--rebuild", action="store_true", help="Force image rebuild")
     p_up.add_argument("--no-cache", dest="no_cache", action="store_true",
                       help="Pass --no-cache to docker build (implies --rebuild)")
@@ -958,6 +1019,8 @@ def main():
 
     if args.command == "up":
         sb = resolve_sandbox(args)
+        sb.profile = load_profile(Path(args.profile)) if args.profile else load_profile(None)
+        sb.profile_explicit = bool(args.profile)
         up(sb, force_rebuild=args.rebuild or args.no_cache, no_cache=args.no_cache,
            explicit_dockerfile=args.dockerfile)
 
