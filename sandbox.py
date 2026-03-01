@@ -17,6 +17,12 @@ All infrastructure (network, squid proxy) is created if not present — idempote
 Default sandbox name is derived from the repo directory name.
 
 TODO:
+  - BUG: Mount path safety check in `up` uses string-prefix matching and can be bypassed.
+    Use `Path.is_relative_to` / `relative_to` for path containment checks.
+  - BUG: `up` rollback currently cleans `meta_dir` only on container start failure;
+    earlier failures can leave ghost instance metadata directories.
+  - BUG: `edit-mounts` validates JSON syntax only; invalid mount schema (not str->str)
+    is accepted at edit time and only handled later with runtime fallback.
   - Add `--pull` flag to `up` to refresh the base image before rebuilding (for OS/base updates)
   - Orphaned volume dirs in workspaces flagged in `status` but not cleaned automatically;
     consider an `sandbox.py prune` command
@@ -200,10 +206,6 @@ class Sandbox:
         return f"sandbox-{self.name}:latest"
 
     @property
-    def mounts_file(self) -> Path:
-        return self.meta_dir / "mounts.json"
-
-    @property
     def config(self) -> "SandboxConfig":
         return SandboxConfig(self, profile=self.profile or copy.deepcopy(DEFAULT_PROFILE))
 
@@ -231,14 +233,6 @@ class Sandbox:
             except OSError:
                 pass
             raise
-
-    def load_mounts(self) -> dict:
-        """Backward-compatible wrapper around SandboxConfig."""
-        return self.config.load_mounts()
-
-    def ensure_mounts_file(self) -> Path:
-        """Backward-compatible wrapper around SandboxConfig."""
-        return self.config.ensure_mounts_file()
 
     # --- Alternative constructors ------------------------------------------
 
@@ -389,9 +383,12 @@ def run(cmd: list, capture=False, check=True, **kwargs):
     return result
 
 
+def _docker_exists(*docker_args: str) -> bool:
+    return run([DOCKER, *docker_args], capture=True, check=False).returncode == 0
+
+
 def container_exists(name: str) -> bool:
-    r = run([DOCKER, "inspect", name], capture=True, check=False)
-    return r.returncode == 0
+    return _docker_exists("inspect", name)
 
 
 def container_running(name: str) -> bool:
@@ -404,13 +401,11 @@ def container_running(name: str) -> bool:
 
 
 def network_exists(name: str) -> bool:
-    r = run([DOCKER, "network", "inspect", name], capture=True, check=False)
-    return r.returncode == 0
+    return _docker_exists("network", "inspect", name)
 
 
 def image_exists(name: str) -> bool:
-    r = run([DOCKER, "image", "inspect", name], capture=True, check=False)
-    return r.returncode == 0
+    return _docker_exists("image", "inspect", name)
 
 
 def repo_root() -> Path:
@@ -432,6 +427,13 @@ def hash_files(paths: list[Path]) -> str:
         if p.exists():
             h.update(p.read_bytes())
     return h.hexdigest()[:16]
+
+
+def edit_file(path: Path) -> bool:
+    """Open $EDITOR for a file and return whether mtime increased."""
+    mtime_before = path.stat().st_mtime
+    subprocess.run([os.environ.get("EDITOR", "vi"), str(path)])
+    return path.stat().st_mtime > mtime_before
 
 
 # ---------------------------------------------------------------------------
@@ -533,10 +535,7 @@ def edit_allowlist():
         + "".join(d + "\n" for d in load_global_allowlist())
     )
 
-    mtime_before = GLOBAL_ALLOWLIST_FILE.stat().st_mtime
-    subprocess.run([os.environ.get("EDITOR", "vi"), str(GLOBAL_ALLOWLIST_FILE)])
-
-    if GLOBAL_ALLOWLIST_FILE.stat().st_mtime <= mtime_before:
+    if not edit_file(GLOBAL_ALLOWLIST_FILE):
         print("[allowlist] No changes.")
         return
 
@@ -615,15 +614,6 @@ def setup_git_remotes(sb: Sandbox):
     run(["git", "-C", str(sb.repo), "remote", "add", remote_name, str(sb.workspace_dir)])
     print(f"[git] Added host remote '{remote_name}' → {sb.workspace_dir}")
     print(f"      Fetch with: git fetch {remote_name}")
-
-
-# ---------------------------------------------------------------------------
-# Container entrypoint script
-# ---------------------------------------------------------------------------
-
-def write_entrypoint(sb: Sandbox) -> Path:
-    """Backward-compatible wrapper around SandboxConfig."""
-    return sb.config.ensure_entrypoint()
 
 
 # ---------------------------------------------------------------------------
@@ -886,12 +876,7 @@ def status():
 def edit_dockerfile(sb: Sandbox, explicit_dockerfile: str = None):
     dockerfile = sb.config.resolve_dockerfile(explicit_dockerfile=explicit_dockerfile)
 
-    editor = os.environ.get("EDITOR", "vi")
-    mtime_before = dockerfile.stat().st_mtime
-    subprocess.run([editor, str(dockerfile)])
-    mtime_after = dockerfile.stat().st_mtime
-
-    if mtime_after > mtime_before:
+    if edit_file(dockerfile):
         print("[ed] Dockerfile changed, rebuilding ...")
         was_running = container_running(sb.container_name)
         try:
@@ -915,11 +900,7 @@ def edit_mounts(sb: Sandbox):
     config = sb.config
     config.ensure_mounts_file()
 
-    editor = os.environ.get("EDITOR", "vi")
-    mtime_before = config.mounts_file.stat().st_mtime
-    subprocess.run([editor, str(config.mounts_file)])
-
-    if config.mounts_file.stat().st_mtime <= mtime_before:
+    if not edit_file(config.mounts_file):
         print("[mounts] No changes.")
         return
 
