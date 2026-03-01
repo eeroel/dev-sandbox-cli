@@ -275,49 +275,70 @@ class SandboxConfig:
     def entrypoint_path(self) -> Path:
         return self.sandbox.meta_dir / "entrypoint.sh"
 
+    @property
+    def triggers_file(self) -> Path:
+        return self.sandbox.meta_dir / "rebuild_triggers.txt"
+
+    def require_managed_file(self, path: Path, label: str) -> Path:
+        """Ensure a managed metadata file exists and is readable."""
+        try:
+            with path.open("rb"):
+                pass
+        except FileNotFoundError as e:
+            raise FileNotFoundError(f"Managed {label} missing: {path}") from e
+        except IsADirectoryError as e:
+            raise ValueError(f"Managed {label} is not a file: {path}") from e
+        except OSError as e:
+            raise ValueError(f"Cannot read managed {label}: {path}: {e}") from e
+        return path
+
     def ensure_mounts_file(self) -> Path:
-        """Write default mounts.json if missing."""
+        """Write mounts.json if missing."""
         self.mounts_file.parent.mkdir(parents=True, exist_ok=True)
         if not self.mounts_file.exists():
             self.mounts_file.write_text(json.dumps(self.profile["mounts"], indent=2))
             print(f"[mounts] No manifest found — wrote default to {self.mounts_file}")
+        self.load_mounts(require_file=True)
         return self.mounts_file
 
-    def load_mounts(self) -> dict:
+    def load_mounts(self, require_file=False) -> dict[str, str]:
         """Load mount mappings. Relative path -> Container path."""
-        if self.mounts_file.exists():
-            try:
-                return _parse_mounts(
-                    json.loads(self.mounts_file.read_text()), str(self.mounts_file)
+        try:
+            raw = self.mounts_file.read_text()
+        except FileNotFoundError:
+            if require_file:
+                raise FileNotFoundError(
+                    f"Managed mounts manifest missing: {self.mounts_file}"
                 )
-            except (json.JSONDecodeError, ValueError):
-                print(f"WARNING: Malformed {self.mounts_file}. Using defaults.")
-        return self.profile["mounts"]
+            return self.profile["mounts"]
+        except IsADirectoryError as e:
+            raise ValueError(
+                f"Managed mounts manifest is not a file: {self.mounts_file}"
+            ) from e
+        except OSError as e:
+            raise ValueError(f"Cannot read mounts manifest {self.mounts_file}: {e}") from e
+        try:
+            return _parse_mounts(
+                json.loads(raw), str(self.mounts_file)
+            )
+        except (json.JSONDecodeError, ValueError) as e:
+            raise ValueError(f"Invalid mounts manifest {self.mounts_file}: {e}") from e
 
-    def ensure_default_dockerfile(self) -> Path:
-        """Write default Dockerfile if missing."""
+    def ensure_default_dockerfile(self, seed_source: Path | None = None) -> Path:
+        """Write managed Dockerfile if missing."""
         self.default_dockerfile_path.parent.mkdir(parents=True, exist_ok=True)
         if not self.default_dockerfile_path.exists():
-            self.default_dockerfile_path.write_text(self.profile["dockerfile"])
-            print(
-                f"[image] No repo Dockerfile found — wrote default to {self.default_dockerfile_path}"
-            )
-        else:
-            print(
-                f"[image] No repo Dockerfile found — using existing default at {self.default_dockerfile_path}"
-            )
-        return self.default_dockerfile_path
-
-    def resolve_dockerfile(self, explicit_dockerfile: str = None) -> Path:
-        """Resolve Dockerfile path by precedence and ensure default fallback exists."""
-        if explicit_dockerfile:
-            dockerfile = Path(explicit_dockerfile).resolve()
-            if not dockerfile.exists():
-                raise FileNotFoundError(f"--dockerfile not found: {dockerfile}")
-            return dockerfile
-        if self.repo_dockerfile_path.exists():
-            return self.repo_dockerfile_path
-        return self.ensure_default_dockerfile()
+            if seed_source is not None:
+                self.default_dockerfile_path.write_text(seed_source.read_text())
+                print(
+                    f"[image] Seeded Dockerfile from {seed_source} -> {self.default_dockerfile_path}"
+                )
+            else:
+                self.default_dockerfile_path.write_text(self.profile["dockerfile"])
+                print(
+                    f"[image] No seed Dockerfile found — wrote default to {self.default_dockerfile_path}"
+                )
+        return self.require_managed_file(self.default_dockerfile_path, "Dockerfile")
 
     def ensure_entrypoint(self) -> Path:
         """Write default entrypoint script only if missing."""
@@ -328,9 +349,36 @@ class SandboxConfig:
             print(
                 f"[entrypoint] No script found — wrote default to {self.entrypoint_path}"
             )
-        self.entrypoint_path.chmod(0o755)
-        return self.entrypoint_path
+        entrypoint = self.require_managed_file(self.entrypoint_path, "entrypoint")
+        entrypoint.chmod(0o755)
+        return entrypoint
 
+    def ensure_triggers_file(self) -> Path:
+        if not self.triggers_file.exists():
+            content = "\n".join(self.profile["rebuild_triggers"])
+            self.triggers_file.write_text(content)
+        return self.triggers_file
+
+    def load_triggers(self) -> list[str]:
+        if self.triggers_file.exists():
+            return [l.strip() for l in self.triggers_file.read_text().splitlines() if l.strip()]
+        return self.profile["rebuild_triggers"]
+    
+    # TODO move to a function instead?
+    def prepare_instance_dir(self, explicit_dockerfile: str = None):
+        self.sandbox.meta_dir.mkdir(parents=True, exist_ok=True)
+        self.sandbox.workspace_dir.mkdir(parents=True, exist_ok=True)
+        self.sandbox.state_dir.mkdir(parents=True, exist_ok=True)
+
+        seed = None
+        if explicit_dockerfile:
+            seed = Path(explicit_dockerfile).resolve()
+        elif self.repo_dockerfile_path.exists():
+            seed = self.repo_dockerfile_path
+        self.ensure_default_dockerfile(seed_source=seed)
+        self.ensure_mounts_file()
+        self.ensure_entrypoint()
+        self.ensure_triggers_file()
 
 # ---------------------------------------------------------------------------
 # CLI name/repo resolution
@@ -578,7 +626,9 @@ def edit_allowlist():
 def image_needs_rebuild(sb: Sandbox, force: bool) -> tuple[bool, str]:
     """Pure read: check whether the image needs to be rebuilt.
     Returns (needs_rebuild, current_hash). Does not modify any state."""
-    trigger_files = [sb.repo / f for f in sb.config.profile["rebuild_triggers"]]
+    # Use the persisted list instead of the one currently in sb.config.profile
+    triggers = sb.config.load_triggers()
+    trigger_files = [sb.repo / f for f in triggers]
     current_hash = hash_files(trigger_files)
 
     if force:
@@ -598,14 +648,12 @@ def build_image(
     sb: Sandbox,
     current_hash: str,
     no_cache=False,
-    explicit_dockerfile: str = None,
     dockerfile: Path | None = None,
 ) -> None:
     """Unconditionally build the image.
     Raises CalledProcessError on build failure."""
-    dockerfile = dockerfile or sb.config.resolve_dockerfile(
-        explicit_dockerfile=explicit_dockerfile
-    )
+    dockerfile = dockerfile or sb.config.default_dockerfile_path
+    sb.config.require_managed_file(dockerfile, "Dockerfile")
 
     print(
         f"[image] Building {sb.image_tag} (trigger hash: {current_hash}){' [no-cache]' if no_cache else ''} ..."
@@ -687,25 +735,15 @@ def _restore_meta_snapshot(sb: Sandbox, existed_before: bool, meta_before: dict)
 def plan_up(sb: Sandbox, force_rebuild=False, explicit_dockerfile: str = None) -> dict:
     """Compute the `up` plan with reads only (no filesystem/docker writes)."""
     config = sb.config
+    dockerfile = config.default_dockerfile_path
+    mounts = config.load_mounts() 
+    entrypoint = config.entrypoint_path
     needs_rebuild, image_hash = image_needs_rebuild(sb, force=force_rebuild)
-    if explicit_dockerfile:
-        dockerfile = Path(explicit_dockerfile).resolve()
-        if not dockerfile.exists():
-            raise FileNotFoundError(f"--dockerfile not found: {dockerfile}")
-        needs_default_dockerfile = False
-    elif config.repo_dockerfile_path.exists():
-        dockerfile = config.repo_dockerfile_path
-        needs_default_dockerfile = False
-    else:
-        dockerfile = config.default_dockerfile_path
-        needs_default_dockerfile = not dockerfile.exists()
 
-    # Generated mounts are seed-once; if a manifest exists, always honor it.
-    mounts = config.load_mounts()
+    dockerfile_seed_source: Path | None = None
 
     proxy_url = f"http://{SQUID_CONTAINER_NAME}:{SQUID_PORT}"
     git_dir = sb.repo / ".git"
-    entrypoint = config.entrypoint_path
 
     docker_cmd = [
         DOCKER,
@@ -759,7 +797,7 @@ def plan_up(sb: Sandbox, force_rebuild=False, explicit_dockerfile: str = None) -
         "needs_rebuild": needs_rebuild,
         "image_hash": image_hash,
         "dockerfile": dockerfile,
-        "needs_default_dockerfile": needs_default_dockerfile,
+        "dockerfile_seed_source": dockerfile_seed_source,
         "mounts": mounts,
         "mount_bindings": mount_bindings,
         "docker_cmd": docker_cmd,
@@ -771,9 +809,13 @@ def up(
     sb: Sandbox, force_rebuild=False, no_cache=False, explicit_dockerfile: str = None
 ):
     print(f"\n=== sandbox up: {sb.name} ===\n")
-    plan = plan_up(
-        sb, force_rebuild=force_rebuild, explicit_dockerfile=explicit_dockerfile
-    )
+    try:
+        sb.config.prepare_instance_dir(explicit_dockerfile=explicit_dockerfile)
+        plan = plan_up(
+            sb, force_rebuild=force_rebuild, explicit_dockerfile=explicit_dockerfile
+        )
+    except (FileNotFoundError, ValueError) as e:
+        die(str(e))
     config = sb.config
     meta_existed_before = (sb.meta_dir / "meta.json").exists()
     meta_before = sb.load_meta() if meta_existed_before else {}
@@ -836,10 +878,13 @@ def up(
     def prepare_local_state():
         for path in (sb.meta_dir, sb.workspace_dir, sb.state_dir):
             ensure_created(path)
+        if meta_existed_before:
+            config.require_managed_file(config.entrypoint_path, "entrypoint").chmod(0o755)
+            return
         config.ensure_mounts_file()
-        if plan["needs_default_dockerfile"]:
-            config.ensure_default_dockerfile()
+        config.ensure_default_dockerfile(seed_source=plan["dockerfile_seed_source"])
         config.ensure_entrypoint()
+        config.ensure_triggers_file()
 
     def rollback_prepare_local_state():
         _restore_meta_snapshot(sb, meta_existed_before, meta_before)
@@ -1079,15 +1124,16 @@ def status():
             print("  (Safe to delete manually or use prune when implemented)\n")
 
 
-def edit_dockerfile(sb: Sandbox, explicit_dockerfile: str = None):
-    dockerfile = sb.config.resolve_dockerfile(explicit_dockerfile=explicit_dockerfile)
+def edit_dockerfile(sb: Sandbox):
+    config = sb.config
+    dockerfile = config.default_dockerfile_path
 
     if edit_file(dockerfile):
         print("[ed] Dockerfile changed, rebuilding ...")
         was_running = container_running(sb.container_name)
         try:
             _, new_hash = image_needs_rebuild(sb, force=True)
-            build_image(sb, new_hash)
+            build_image(sb, new_hash, dockerfile=dockerfile)
             sb.update_meta({"image_hash": new_hash})
         except Exception as e:
             print(f"[ed] Build failed: {e}")
@@ -1107,17 +1153,22 @@ def edit_dockerfile(sb: Sandbox, explicit_dockerfile: str = None):
 def edit_mounts(sb: Sandbox):
     """Open $EDITOR on the mounts manifest, validate JSON, and restart sandbox if running."""
     config = sb.config
+    if (sb.meta_dir / "meta.json").exists():
+        try:
+            config.require_managed_file(config.mounts_file, "mounts manifest")
+        except (FileNotFoundError, ValueError) as e:
+            die(str(e))
     config.ensure_mounts_file()
 
     if not edit_file(config.mounts_file):
         print("[mounts] No changes.")
         return
 
-    # Validate JSON
+    # Validate JSON + schema
     try:
-        json.loads(config.mounts_file.read_text())
-    except json.JSONDecodeError as e:
-        die(f"Invalid JSON in mounts file: {e}")
+        _parse_mounts(json.loads(config.mounts_file.read_text()), str(config.mounts_file))
+    except (json.JSONDecodeError, ValueError) as e:
+        die(f"Invalid mounts manifest: {e}")
 
     print("[mounts] Manifest updated.")
     if container_running(sb.container_name):
@@ -1269,7 +1320,7 @@ def main():
         edit_allowlist()
     elif args.command in ("edit-dockerfile", "ed"):
         sb = resolve_sandbox(args)
-        edit_dockerfile(sb, explicit_dockerfile=getattr(args, "dockerfile", None))
+        edit_dockerfile(sb)
     elif args.command in ("edit-mounts", "em"):
         sb = resolve_sandbox(args)
         edit_mounts(sb)
