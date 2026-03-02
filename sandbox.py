@@ -12,14 +12,6 @@ TODO:
   - On `up`, add cli prompt to set git username and email. Default to values from repo, but allow changing them.
   - Warn or error on `up` if the same --name is reused across different repos
     (currently only catches this if meta already exists)
-
-YAGNI / worth revisiting:
-  - The allowlist editor (edit-allowlist / reconfigure_squid / write_squid_conf) is ~80 lines for
-    a feature that might never be used if the proxy is always deny-all or always the same config.
-    Could be replaced with "just edit ~/.sandbox/squid/squid.conf and restart squid manually".
-  - Profile files (config.json, Dockerfile, entrypoint.sh) — mounts and rebuild_triggers
-    are now unified in config.json; Dockerfile and entrypoint.sh remain separate files as
-    they are non-JSON and benefit from syntax highlighting / direct editing.
 """
 
 import argparse
@@ -241,23 +233,26 @@ def resolve_dockerfile(sb: Sandbox, explicit_dockerfile: str = None) -> Path:
             raise FileNotFoundError(f"--dockerfile not found: {p}")
         return p
     if not sb.dockerfile_path.exists():
-        profile = sb.profile or copy.deepcopy(DEFAULT_PROFILE)
-        sb.dockerfile_path.write_text(profile["dockerfile"])
-        print(f"[image] Wrote default Dockerfile to {sb.dockerfile_path}")
+        die(f"Dockerfile not found at {sb.dockerfile_path}. Instance may be corrupted — re-run `up`.")
     return sb.dockerfile_path
 
 
+def load_config(sb: Sandbox) -> dict:
+    """Load and validate config.json. Dies on missing file or invalid JSON."""
+    if not sb.config_file.exists():
+        die(f"config.json not found at {sb.config_file}. Instance may be corrupted — re-run `up`.")
+    try:
+        return json.loads(sb.config_file.read_text())
+    except json.JSONDecodeError as e:
+        die(f"Malformed config.json at {sb.config_file}: {e}. Instance may be corrupted — re-run `up`.")
+
+
 def load_mounts(sb: Sandbox) -> dict:
-    """Load mount mappings from seeded config.json. Falls back to profile defaults."""
-    if sb.config_file.exists():
-        try:
-            cfg = json.loads(sb.config_file.read_text())
-            if "mounts" in cfg:
-                return cfg["mounts"]
-        except json.JSONDecodeError:
-            print(f"WARNING: Malformed {sb.config_file}. Using defaults.")
-    profile = sb.profile or copy.deepcopy(DEFAULT_PROFILE)
-    return profile["mounts"]
+    """Load mount mappings from seeded config.json."""
+    cfg = load_config(sb)
+    if "mounts" not in cfg:
+        die(f"config.json at {sb.config_file} is missing 'mounts' key. Instance may be corrupted — re-run `up`.")
+    return cfg["mounts"]
 
 
 # ---------------------------------------------------------------------------
@@ -479,14 +474,8 @@ def image_needs_rebuild(sb: Sandbox, force: bool) -> tuple[bool, str]:
     to it are reflected on the next `up`. config.json is excluded — mounts are
     a runtime concern (passed as -v flags) with no bearing on image contents.
     """
-    profile = sb.profile or DEFAULT_PROFILE
-    triggers = profile["rebuild_triggers"]
-    if sb.config_file.exists():
-        try:
-            cfg = json.loads(sb.config_file.read_text())
-            triggers = cfg.get("rebuild_triggers", triggers)
-        except json.JSONDecodeError:
-            pass
+    cfg = load_config(sb)
+    triggers = cfg.get("rebuild_triggers", [])
     trigger_files = [sb.repo / f for f in triggers]
     # Include the seeded Dockerfile so manual edits automatically trigger a rebuild.
     instance_files = [sb.dockerfile_path]
@@ -593,7 +582,7 @@ def up(sb: Sandbox, force_rebuild=False, no_cache=False, explicit_dockerfile: st
         print(f"[container] Removing stopped container {sb.container_name} ...")
         run([DOCKER, "rm", sb.container_name], check=False, capture=True)
 
-    _start(sb, explicit_dockerfile=explicit_dockerfile)
+    _start(sb)
 
 
 def _provision(sb: Sandbox):
@@ -632,7 +621,7 @@ def _provision(sb: Sandbox):
     print(f"[provision] Instance '{sb.name}' provisioned.")
 
 
-def _start(sb: Sandbox, explicit_dockerfile: str = None):
+def _start(sb: Sandbox):
     """Start the sandbox container. Assumes _provision() has already run."""
     if not sb.entrypoint_path.exists():
         die(f"entrypoint.sh not found at {sb.entrypoint_path}. Was the instance provisioned?")
@@ -816,19 +805,13 @@ def edit_dockerfile(sb: Sandbox):
 
 def edit_mounts(sb: Sandbox):
     if not sb.config_file.exists():
-        profile = sb.profile or copy.deepcopy(DEFAULT_PROFILE)
-        cfg = {"mounts": profile["mounts"], "rebuild_triggers": profile["rebuild_triggers"]}
-        sb.config_file.write_text(json.dumps(cfg, indent=2))
-        print(f"[mounts] No config found — wrote default to {sb.config_file}")
+        die(f"config.json not found at {sb.config_file}. Instance may be corrupted — re-run `up`.")
 
     if not edit_file(sb.config_file):
         print("[mounts] No changes.")
         return
 
-    try:
-        json.loads(sb.config_file.read_text())
-    except json.JSONDecodeError as e:
-        die(f"Invalid JSON in {sb.config_file}: {e}")
+    load_config(sb)  # validates JSON after editing
 
     print("[mounts] Config updated.")
     if container_running(sb.container_name):
@@ -878,7 +861,6 @@ def parse_args():
 
     p_ed = sub.add_parser("edit-dockerfile", aliases=["ed"])
     p_ed.add_argument("--name", "-n", default=_REPO_DEFAULT)
-    p_ed.add_argument("--dockerfile", default=None, metavar="PATH")
 
     p_em = sub.add_parser("edit-mounts", aliases=["em"])
     p_em.add_argument("--name", "-n", default=_REPO_DEFAULT)
