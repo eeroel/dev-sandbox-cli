@@ -7,7 +7,20 @@ Each sandbox gets its own squid proxy, started and stopped with the container.
 Default sandbox name is derived from the repo directory name.
 
 TODO:
-  - In defaults, add commented examples for how to install packages in image, and for allowlist
+  - Remove rebuild_triggers system entirely. Currently sandbox hashes a list of files
+    (uv.lock, requirements.txt, pyproject.toml etc.) alongside the Dockerfile to decide
+    whether to rebuild the image on `up`. This is redundant: Docker's own layer caching
+    already handles this correctly — if a COPYed file changes, Docker invalidates from
+    that layer forward; if it hasn't changed, the cached layer is reused. The rebuild_triggers
+    list only matters for files that influence the build but aren't COPYed, which is an
+    unusual/broken Dockerfile pattern not worth supporting. Removal scope:
+      - `rebuild_triggers` key from profile config.json and load_profile()
+      - `image_needs_rebuild()` function
+      - `image_hash` storage in meta.json / update_meta() calls
+      - `--rebuild` and `--no-cache` flags on `up` (or keep --no-cache as a passthrough to docker build)
+      - `config.json` seeding in _provision() simplifies or disappears if mounts is the only remaining key
+    After removal, `sandbox up` always runs `docker build` and relies on Docker cache.
+    Net effect: simpler code, same behaviour for correct Dockerfiles.
   - Add `--pull` flag to `up` to refresh the base image before rebuilding (for OS/base updates)
   - Consider a `sandbox.py prune` command to automatically remove orphaned sandbox dirs under ~/.sandbox/
   - On `up`, add cli prompt to set git username and email. Default to values from repo, but allow changing them.
@@ -455,7 +468,7 @@ def build_image(sb: Sandbox, current_hash: str, no_cache=False) -> None:
     cmd = [DOCKER, "build", "-t", sb.image_tag, "-f", str(dockerfile)]
     if no_cache:
         cmd.append("--no-cache")
-    cmd.append(str(sb.image_dir))
+    cmd.append(str(sb.repo))
     run(cmd)
 
 
@@ -532,10 +545,10 @@ def up(sb: Sandbox, force_rebuild=False, no_cache=False):
             run([DOCKER, "rm", sb.container_name], check=False, capture=True)
 
         _start(sb)
-    except Exception:
+    except BaseException:
         if is_new:
             print(f"\n[up] First-time setup failed — rolling back '{sb.name}' ...")
-            _unprovision(sb)
+            _unprovision(sb, force=True)
         raise
 
 
@@ -644,10 +657,11 @@ def down(sb: Sandbox):
         run([DOCKER, "rm", "-f", sb.squid_container_name], check=False, capture=True)
 
 
-def _unprovision(sb: Sandbox):
+def _unprovision(sb: Sandbox, force: bool = False):
     """Tear down all per-sandbox runtime resources and seeded files.
     Safe to call at any point — all steps are best-effort.
     Does NOT remove the image (expensive, may be reused on retry).
+    If force=True, removes workspace and volumes even if they have content.
     """
     # Stop/remove main container
     if container_running(sb.container_name):
@@ -668,9 +682,16 @@ def _unprovision(sb: Sandbox):
         print(f"[git] Removing host remote '{remote_name}' ...")
         run(["git", "-C", str(sb.repo), "remote", "remove", remote_name], check=False)
 
-    # Remove config dir only — workspace and volumes are left intact
-    if sb.meta_dir.exists():
-        shutil.rmtree(sb.meta_dir)
+    # Remove config dir — workspace and volumes are left intact unless force=True
+    if force:
+        if sb.sandbox_dir.exists():
+            shutil.rmtree(sb.sandbox_dir)
+    else:
+        if sb.meta_dir.exists():
+            shutil.rmtree(sb.meta_dir)
+        # Clean up sandbox_dir itself if now empty
+        if sb.sandbox_dir.exists() and not any(sb.sandbox_dir.iterdir()):
+            sb.sandbox_dir.rmdir()
 
 
 def destroy(sb: Sandbox):
