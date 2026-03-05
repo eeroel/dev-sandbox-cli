@@ -44,20 +44,6 @@ DOCKER = shutil.which("podman") or shutil.which("docker")
 
 DEFAULT_PROFILE = {
     "allowlist": [],
-    "dockerfile": """\
-FROM python:3.13-slim
-
-WORKDIR /workspace
-
-RUN apt-get update && apt-get install -y --no-install-recommends \\
-    git curl ca-certificates ripgrep \\
-    && rm -rf /var/lib/apt/lists/*
-
-RUN pip install --no-cache-dir uv ruff ty
-
-CMD ["bash"]
-""",
-    # Maps relative path in state_dir -> absolute path in container
     "mounts": {
         # example:
         # ".config": "/root/.config"
@@ -71,7 +57,26 @@ CMD ["bash"]
         "package-lock.json",
         "yarn.lock",
     ],
-    "entrypoint_script": """\
+    # Files seeded into config/image/ — the Docker build context.
+    # Dockerfile is required; everything else is whatever the Dockerfile COPYs.
+    "image_files": {
+        "Dockerfile": """\
+FROM python:3.13-slim
+
+WORKDIR /workspace
+
+RUN apt-get update && apt-get install -y --no-install-recommends \\
+    git curl ca-certificates ripgrep \\
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir uv ruff ty
+
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["bash"]
+""",
+        "entrypoint.sh": """\
 #!/bin/bash
 set -e
 
@@ -93,6 +98,7 @@ fi
 echo "[sandbox] Ready. Repo: $(git log --oneline -1 2>/dev/null || echo 'empty')"
 exec "$@"
 """,
+    },
 }
 
 
@@ -101,9 +107,9 @@ def load_profile(profile_dir: Path | None) -> dict:
 
     A profile directory may contain:
       config.json   — optional, keys: mounts (object), rebuild_triggers (array)
-      Dockerfile    — optional, replaces the default image definition
-      entrypoint.sh — optional, replaces the default container entrypoint
       allowlist.txt — optional, one domain per line; replaces the default (empty) allowlist
+      image/        — optional, Docker build context; replaces the default image_files entirely
+                      Must contain a Dockerfile; any other files are available to COPY.
     """
     profile = copy.deepcopy(DEFAULT_PROFILE)
     if profile_dir is None:
@@ -130,20 +136,21 @@ def load_profile(profile_dir: Path | None) -> dict:
                 die(f"{config_path}: 'rebuild_triggers' must be a JSON array")
             profile["rebuild_triggers"] = cfg["rebuild_triggers"]
 
-    dockerfile_path = profile_dir / "Dockerfile"
-    if dockerfile_path.exists():
-        profile["dockerfile"] = dockerfile_path.read_text()
-
-    entrypoint_path = profile_dir / "entrypoint.sh"
-    if entrypoint_path.exists():
-        profile["entrypoint_script"] = entrypoint_path.read_text()
-
     allowlist_path = profile_dir / "allowlist.txt"
     if allowlist_path.exists():
         profile["allowlist"] = [
             line.strip() for line in allowlist_path.read_text().splitlines()
             if line.strip() and not line.startswith("#")
         ]
+
+    image_dir = profile_dir / "image"
+    if image_dir.exists():
+        if not (image_dir / "Dockerfile").exists():
+            die(f"Profile image/ dir found but contains no Dockerfile: {image_dir}")
+        profile["image_files"] = {
+            str(p.relative_to(image_dir)): p.read_text()
+            for p in image_dir.rglob("*") if p.is_file()
+        }
 
     return profile
 
@@ -195,16 +202,16 @@ class Sandbox:
         return f"sandbox-{self.name}:latest"
 
     @property
+    def image_dir(self) -> Path:
+        return self.meta_dir / "image"
+
+    @property
     def dockerfile_path(self) -> Path:
-        return self.meta_dir / "Dockerfile"
+        return self.image_dir / "Dockerfile"
 
     @property
     def config_file(self) -> Path:
         return self.meta_dir / "config.json"
-
-    @property
-    def entrypoint_path(self) -> Path:
-        return self.meta_dir / "entrypoint.sh"
 
     # --- Meta persistence --------------------------------------------------
 
@@ -478,16 +485,16 @@ def edit_allowlist(sb: Sandbox):
 def image_needs_rebuild(sb: Sandbox, force: bool) -> tuple[bool, str]:
     """Pure read: check whether the image needs to be rebuilt.
 
-    Hashes repo trigger files AND the seeded Dockerfile so that manual edits
-    to it are reflected on the next `up`. config.json is excluded — mounts are
-    a runtime concern (passed as -v flags) with no bearing on image contents.
+    Hashes repo trigger files AND all files in image_dir (the build context),
+    so any manual edit to Dockerfile or any baked-in file triggers a rebuild.
+    config.json is excluded — mounts are a runtime concern with no bearing on image contents.
     """
     cfg = load_config(sb)
     triggers = cfg.get("rebuild_triggers", [])
     trigger_files = [sb.repo / f for f in triggers]
-    # Include the seeded Dockerfile so manual edits automatically trigger a rebuild.
-    instance_files = [sb.dockerfile_path]
-    current_hash = hash_files(trigger_files + instance_files)
+    image_files = sorted(sb.image_dir.rglob("*")) if sb.image_dir.exists() else []
+    image_files = [p for p in image_files if p.is_file()]
+    current_hash = hash_files(trigger_files + image_files)
 
     if force:
         return True, current_hash
@@ -511,7 +518,7 @@ def build_image(sb: Sandbox, current_hash: str, no_cache=False, explicit_dockerf
     cmd = [DOCKER, "build", "-t", sb.image_tag, "-f", str(dockerfile)]
     if no_cache:
         cmd.append("--no-cache")
-    cmd.append(str(sb.repo))
+    cmd.append(str(sb.image_dir))
     run(cmd)
 
 
@@ -619,12 +626,12 @@ def _provision(sb: Sandbox):
     sb.config_file.write_text(json.dumps(config_data, indent=2))
     print(f"[provision] Wrote {sb.config_file}")
 
-    sb.dockerfile_path.write_text(profile["dockerfile"])
-    print(f"[provision] Wrote {sb.dockerfile_path}")
-
-    sb.entrypoint_path.write_text(profile["entrypoint_script"])
-    sb.entrypoint_path.chmod(0o755)
-    print(f"[provision] Wrote {sb.entrypoint_path}")
+    sb.image_dir.mkdir(parents=True, exist_ok=True)
+    for filename, content in profile["image_files"].items():
+        dest = sb.image_dir / filename
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(content)
+        print(f"[provision] Wrote {dest}")
 
     allowlist = profile.get("allowlist", [])
     sb.allowlist_path.write_text(
@@ -645,9 +652,6 @@ def _provision(sb: Sandbox):
 
 def _start(sb: Sandbox):
     """Start the sandbox container. Assumes _provision() has already run."""
-    if not sb.entrypoint_path.exists():
-        die(f"entrypoint.sh not found at {sb.entrypoint_path}. Was the instance provisioned?")
-
     ensure_squid(sb)
 
     proxy_url = f"http://{sb.squid_container_name}:{SQUID_PORT}"
@@ -664,7 +668,6 @@ def _start(sb: Sandbox):
         "-e", "no_proxy=localhost,127.0.0.1",
         "-v", f"{git_dir}:/repo-git:ro",
         "-v", f"{sb.workspace_dir}:/llm-workspace:rw",
-        "-v", f"{sb.entrypoint_path}:/entrypoint.sh:ro",
     ]
 
     for rel_path, container_path in load_mounts(sb).items():
@@ -676,7 +679,6 @@ def _start(sb: Sandbox):
         docker_cmd.extend(["-v", f"{host_path}:{container_path}:rw"])
 
     docker_cmd.extend([
-        "--entrypoint", "/entrypoint.sh",
         sb.image_tag,
         "bash",
     ])
@@ -800,14 +802,14 @@ def status():
                 squid_name = f"sandbox-squid-{name}"
                 squid_state = c_states.get(squid_name, "no container")
 
-                df = d / "config" / "Dockerfile"
+                df = d / "config" / "image"
                 df_info = str(df) if df.exists() else "None found"
 
                 print(f"  Sandbox: {name}")
                 print(f"    State     : {state}")
                 print(f"    Squid     : {squid_state}")
                 print(f"    Repo      : {repo_str}")
-                print(f"    Dockerfile: {df_info}")
+                print(f"    Image dir : {df_info}")
                 print()
 
     if SANDBOX_HOME.exists():
