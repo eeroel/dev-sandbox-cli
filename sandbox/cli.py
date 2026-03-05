@@ -408,7 +408,16 @@ def edit_allowlist(sb: Sandbox):
 # ---------------------------------------------------------------------------
 
 def build_image(sb: Sandbox, no_cache=False) -> None:
-    """Unconditionally build the image. Relies on Docker's layer cache."""
+    """Unconditionally build the image. Relies on Docker's layer cache.
+
+    We always run `docker build` rather than trying to short-circuit it ourselves.
+    Docker's layer cache handles this correctly: if a COPYed file hasn't changed,
+    the cached layer is reused; if it has, Docker invalidates from that layer forward.
+
+    The build context is the repo root (not the image/ directory) because Dockerfiles
+    typically COPY dependency files (uv.lock, pyproject.toml, requirements.txt, etc.)
+    from the repo in order to pre-install deps into the image.
+    """
     dockerfile = resolve_dockerfile(sb)
 
     print(f"[image] Building {sb.image_tag}{' [no-cache]' if no_cache else ''} ...")
@@ -416,7 +425,8 @@ def build_image(sb: Sandbox, no_cache=False) -> None:
     cmd = [DOCKER, "build", "-t", sb.image_tag, "-f", str(dockerfile)]
     if no_cache:
         cmd.append("--no-cache")
-    cmd.append(str(sb.image_dir))
+    # Build context is the repo root — Dockerfile needs access to repo files (see docstring).
+    cmd.append(str(sb.repo))
     run(cmd)
 
 
