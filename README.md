@@ -1,5 +1,7 @@
 # sandbox
 
+THIS IS A WORK IN PROGRESS. USE AT YOUR OWN RISK.
+
 Dev sandbox container manager (podman/docker, docker-compose-free).
 
 ## Install
