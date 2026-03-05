@@ -739,13 +739,13 @@ def _unprovision(sb: Sandbox):
         print(f"[git] Removing host remote '{remote_name}' ...")
         run(["git", "-C", str(sb.repo), "remote", "remove", remote_name], check=False)
 
-    # Remove seeded dirs — workspace and volumes sit under sandbox_dir too
-    if sb.sandbox_dir.exists():
-        shutil.rmtree(sb.sandbox_dir)
+    # Remove config dir only — workspace and volumes are left intact
+    if sb.meta_dir.exists():
+        shutil.rmtree(sb.meta_dir)
 
 
 def destroy(sb: Sandbox):
-    """Remove all resources. To fully nuke: rm -rf ~/.sandbox/{name}"""
+    """Remove container, image, and config. Workspace and volumes are left intact."""
     _unprovision(sb)
 
     if image_exists(sb.image_tag):
@@ -753,7 +753,12 @@ def destroy(sb: Sandbox):
         run([DOCKER, "rmi", sb.image_tag], check=False)
 
     print(f"[destroy] {sb.name} destroyed.")
-    print(f"  To fully remove all data: rm -rf {sb.sandbox_dir}")
+
+    lingering = [d for d in (sb.workspace_dir, sb.state_dir) if d.exists()]
+    if lingering:
+        print(f"  Data remaining — remove manually if no longer needed:")
+        for d in lingering:
+            print(f"    rm -rf {d}")
 
 
 def infra_down():
