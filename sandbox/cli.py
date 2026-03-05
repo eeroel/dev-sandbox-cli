@@ -45,13 +45,18 @@ def load_profile(profile_dir: Path) -> dict:
 
     A profile directory must contain:
       image/Dockerfile  — required, Docker build context
-      config.json       — required, keys: mounts (object)
+      config.json       — required, keys: mounts (object), inject (array, optional)
     And may also contain:
       image/*           — any other files the Dockerfile COPYs
       allowlist.txt     — optional, one domain per line
+
+    inject: list of file paths relative to the repo root that are copied into image/
+    at provision time (and on `replace`), so the Dockerfile can COPY them into the image.
+    These files are seeded once — edits to the repo originals have no effect until `replace`.
     """
     profile = {
         "allowlist": [],
+        "inject": [],
     }
 
     profile_dir = profile_dir.resolve()
@@ -80,6 +85,9 @@ def load_profile(profile_dir: Path) -> dict:
     if "mounts" not in cfg or not isinstance(cfg["mounts"], dict):
         die(f"{config_path}: 'mounts' must be a JSON object")
     profile["mounts"] = cfg["mounts"]
+    profile["inject"] = cfg.get("inject", [])
+    if not isinstance(profile["inject"], list):
+        die(f"{config_path}: 'inject' must be a JSON array")
 
     allowlist_path = profile_dir / "allowlist.txt"
     if allowlist_path.exists():
@@ -355,11 +363,12 @@ def load_sandbox_allowlist(sb: Sandbox) -> list[str]:
 def ensure_squid(sb: Sandbox):
     allowlist = load_sandbox_allowlist(sb)
 
+    # Always recreate the squid container so allowlist changes are picked up on every `up`.
     if container_running(sb.squid_container_name):
-        print(f"[squid] {sb.squid_container_name} already running.")
-        return
-
-    if container_exists(sb.squid_container_name):
+        print(f"[squid] Recreating {sb.squid_container_name} to apply latest allowlist ...")
+        run([DOCKER, "stop", "-t", "0", sb.squid_container_name], check=False, capture=True)
+        run([DOCKER, "rm", sb.squid_container_name], check=False, capture=True)
+    elif container_exists(sb.squid_container_name):
         print(f"[squid] Removing stopped squid container {sb.squid_container_name} ...")
         run([DOCKER, "rm", sb.squid_container_name])
 
@@ -414,9 +423,10 @@ def build_image(sb: Sandbox, no_cache=False) -> None:
     Docker's layer cache handles this correctly: if a COPYed file hasn't changed,
     the cached layer is reused; if it has, Docker invalidates from that layer forward.
 
-    The build context is the repo root (not the image/ directory) because Dockerfiles
-    typically COPY dependency files (uv.lock, pyproject.toml, requirements.txt, etc.)
-    from the repo in order to pre-install deps into the image.
+    The build context is image/ (the seeded directory), not the repo root. This means
+    the Dockerfile can only access files that were explicitly seeded or injected —
+    live changes to the repo never bleed into the image. Use `inject` in config.json
+    to pull specific files from the repo into the build context at provision/replace time.
     """
     dockerfile = resolve_dockerfile(sb)
 
@@ -425,8 +435,8 @@ def build_image(sb: Sandbox, no_cache=False) -> None:
     cmd = [DOCKER, "build", "-t", sb.image_tag, "-f", str(dockerfile)]
     if no_cache:
         cmd.append("--no-cache")
-    # Build context is the repo root — Dockerfile needs access to repo files (see docstring).
-    cmd.append(str(sb.repo))
+    # Build context is image/ — only seeded and injected files are visible to the Dockerfile.
+    cmd.append(str(sb.image_dir))
     run(cmd)
 
 
@@ -479,7 +489,12 @@ def wait_for_clone(sb: Sandbox, timeout=60):
 
 
 def up(sb: Sandbox, no_cache=False):
+    """Provision (first time) and start the sandbox. No-op if already running."""
     print(f"\n=== sandbox up: {sb.name} ===\n")
+
+    if not sb.meta_dir.exists() and sb.profile is None:
+        die("No existing sandbox found and no template provided. "
+            "Run from a directory containing .sandbox-template, or use --template.")
 
     is_new = not sb.meta_dir.exists()
 
@@ -487,13 +502,13 @@ def up(sb: Sandbox, no_cache=False):
     try:
         _provision(sb)
 
-        # Always build — relies on Docker's layer cache for efficiency.
-        build_image(sb, no_cache=no_cache)
-
         if container_running(sb.container_name):
             print(f"[container] {sb.container_name} is already running.")
             setup_git_remotes(sb)
             return
+
+        # Always build — relies on Docker’s layer cache for efficiency.
+        build_image(sb, no_cache=no_cache)
 
         if container_exists(sb.container_name):
             print(f"[container] Removing stopped container {sb.container_name} ...")
@@ -507,12 +522,53 @@ def up(sb: Sandbox, no_cache=False):
         raise
 
 
+def restart(sb: Sandbox, no_cache=False):
+    """Stop, rebuild image from seeded files, and restart. Does not re-seed from template."""
+    if not sb.meta_dir.exists():
+        die(f"Sandbox '{sb.name}' has not been provisioned. Run `sandbox up` first.")
+    print(f"\n=== sandbox restart: {sb.name} ===\n")
+    down(sb)
+    build_image(sb, no_cache=no_cache)
+    _start(sb)
+
+
+def replace(sb: Sandbox, no_cache=False):
+    """Wipe meta, re-seed from template, rebuild image, restart. Volumes and workspace are preserved."""
+    if not sb.meta_dir.exists():
+        die(f"Sandbox '{sb.name}' has not been provisioned. Run `sandbox up` first.")
+    if sb.profile is None:
+        die("No template provided. Run from a directory containing .sandbox-template, or use --template.")
+    print(f"\n=== sandbox replace: {sb.name} ===\n")
+    print(f"[replace] Stopping and wiping meta for '{sb.name}' ...")
+    down(sb)
+    _unprovision(sb, force=False)  # keeps workspace and volumes
+    _provision(sb)
+    build_image(sb, no_cache=no_cache)
+    _start(sb)
+
+
+def _copy_inject_files(sb: Sandbox, profile: dict):
+    """Copy inject files from the repo into image/ so the Dockerfile can COPY them."""
+    for rel_path in profile.get("inject", []):
+        src = sb.repo / rel_path
+        if not src.exists():
+            print(f"[inject] WARNING: {src} not found — skipping.")
+            continue
+        if not src.is_file():
+            print(f"[inject] WARNING: {src} is not a file — skipping.")
+            continue
+        dest = sb.image_dir / Path(rel_path).name
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dest)
+        print(f"[inject] Copied {src} → {dest}")
+
+
 def _provision(sb: Sandbox):
     """Seed instance files on first creation only. Idempotent: no-ops if already provisioned."""
     if sb.meta_dir.exists():
         if sb.profile_explicit:
-            print(f"[profile] Instance '{sb.name}' already exists — ignoring --profile to protect manual edits.")
-            print(f"          To reset, run: sandbox.py destroy --name {sb.name} && sandbox.py up --profile ...")
+            print(f"[template] Instance '{sb.name}' already exists — ignoring --template to protect manual edits.")
+            print(f"           To re-seed from template, run: sandbox replace --name {sb.name}")
         return
 
     print(f"[provision] First-time setup for '{sb.name}' ...")
@@ -522,16 +578,18 @@ def _provision(sb: Sandbox):
     sb.workspace_dir.mkdir(parents=True, exist_ok=True)
     sb.state_dir.mkdir(parents=True, exist_ok=True)
 
-    config_data = {"mounts": profile["mounts"]}
+    config_data = {"mounts": profile["mounts"], "inject": profile["inject"]}
     sb.config_file.write_text(json.dumps(config_data, indent=2))
     print(f"[provision] Wrote {sb.config_file}")
 
     sb.image_dir.mkdir(parents=True, exist_ok=True)
-    for filename, content in profile["image_files"].items():
+    for filename, file_content in profile["image_files"].items():
         dest = sb.image_dir / filename
         dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(content)
+        dest.write_text(file_content)
         print(f"[provision] Wrote {dest}")
+
+    _copy_inject_files(sb, profile)
 
     allowlist = profile.get("allowlist", [])
     sb.allowlist_path.write_text(
@@ -651,6 +709,8 @@ def _unprovision(sb: Sandbox, force: bool = False):
 
 def destroy(sb: Sandbox):
     """Remove container, image, and config. Workspace and volumes are left intact."""
+    if not sb.meta_dir.exists() and not image_exists(sb.image_tag):
+        die(f"Sandbox '{sb.name}' not found — nothing to destroy.")
     _unprovision(sb)
 
     if image_exists(sb.image_tag):
@@ -770,9 +830,9 @@ def edit_mounts(sb: Sandbox):
 
 
 def cmd_init(profile_name: str):
-    dest = Path.cwd() / ".sandbox-profile"
+    dest = Path.cwd() / ".sandbox-template"
     if dest.exists():
-        die(f".sandbox-profile already exists in {Path.cwd()}. Remove it first to reinitialise.")
+        die(f".sandbox-template already exists in {Path.cwd()}. Remove it first to reinitialise.")
 
     profiles_dir = Path(__file__).parent / "profiles"
     if not profiles_dir.exists():
@@ -784,7 +844,7 @@ def cmd_init(profile_name: str):
         die(f"Profile '{profile_name}' not found. Available: {', '.join(sorted(available))}")
 
     shutil.copytree(profile_dir, dest)
-    print(f"[init] Initialised .sandbox-profile from profile '{profile_name}' in {Path.cwd()}")
+    print(f"[init] Initialised .sandbox-template from profile '{profile_name}' in {Path.cwd()}")
     print(f"  Edit {dest} to customise, then run: sandbox up")
 
 
@@ -808,15 +868,23 @@ def parse_args():
     parser.add_argument("--docker", metavar="BIN", help="Override docker/podman binary")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_init = sub.add_parser("init", help="Initialise .sandbox-profile in current directory from a profile")
+    p_init = sub.add_parser("init", help="Initialise .sandbox-template in current directory")
     p_init.add_argument("profile_name", nargs="?", default="default", metavar="PROFILE")
 
-    p_up = sub.add_parser("up", help="Create/start sandbox (idempotent)")
+    p_up = sub.add_parser("up", help="Provision and start sandbox (no-op if already running)")
     p_up.add_argument("--name", "-n", default=_REPO_DEFAULT)
     p_up.add_argument("--repo", "-r", default=None)
-    p_up.add_argument("--profile", default=None, metavar="DIR")
+    p_up.add_argument("--template", default=None, metavar="DIR")
     p_up.add_argument("--no-cache", dest="no_cache", action="store_true")
 
+    p_restart = sub.add_parser("restart", help="Rebuild image from seeded files and restart container")
+    p_restart.add_argument("--name", "-n", default=_REPO_DEFAULT)
+    p_restart.add_argument("--no-cache", dest="no_cache", action="store_true")
+
+    p_replace = sub.add_parser("replace", help="Re-seed from template, rebuild, restart (keeps volumes/workspace)")
+    p_replace.add_argument("--name", "-n", default=_REPO_DEFAULT)
+    p_replace.add_argument("--template", default=None, metavar="DIR")
+    p_replace.add_argument("--no-cache", dest="no_cache", action="store_true")
     p_down = sub.add_parser("down", help="Stop sandbox container (keep volumes/image)")
     p_down.add_argument("--name", "-n", default=_REPO_DEFAULT)
 
@@ -855,16 +923,31 @@ def main():
         cmd_init(args.profile_name)
     elif args.command == "up":
         sb = resolve_sandbox(args)
-        if args.profile:
-            profile_dir = Path(args.profile)
-        elif (Path.cwd() / ".sandbox-profile").is_dir():
-            profile_dir = Path.cwd() / ".sandbox-profile"
-            print(f"[profile] Using .sandbox-profile from {Path.cwd()}")
+        if args.template:
+            template_dir = Path(args.template)
+        elif (Path.cwd() / ".sandbox-template").is_dir():
+            template_dir = Path.cwd() / ".sandbox-template"
+            print(f"[template] Using .sandbox-template from {Path.cwd()}")
         else:
-            die("No profile found. Run `sandbox init` to create a .sandbox-profile in this directory.")
-        sb.profile = load_profile(profile_dir)
-        sb.profile_explicit = bool(args.profile)
+            template_dir = None
+        if template_dir:
+            sb.profile = load_profile(template_dir)
+            sb.profile_explicit = bool(args.template)
         up(sb, no_cache=args.no_cache)
+    elif args.command == "restart":
+        sb = resolve_sandbox(args)
+        restart(sb, no_cache=args.no_cache)
+    elif args.command == "replace":
+        sb = resolve_sandbox(args)
+        if args.template:
+            template_dir = Path(args.template)
+        elif (Path.cwd() / ".sandbox-template").is_dir():
+            template_dir = Path.cwd() / ".sandbox-template"
+            print(f"[template] Using .sandbox-template from {Path.cwd()}")
+        else:
+            die("No template found. Run from a directory containing .sandbox-template, or use --template.")
+        sb.profile = load_profile(template_dir)
+        replace(sb, no_cache=args.no_cache)
     elif args.command == "down":
         sb = resolve_sandbox(args)
         down(sb)
@@ -887,7 +970,6 @@ def main():
     elif args.command == "exec":
         sb = resolve_sandbox(args)
         exec_cmd(sb, args.cmd)
-
 
 if __name__ == "__main__":
     main()
