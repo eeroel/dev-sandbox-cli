@@ -16,7 +16,6 @@ TODO:
 """
 
 import argparse
-import copy
 import hashlib
 import json
 import os
@@ -42,99 +41,50 @@ SQUID_PORT = 3128
 DOCKER = shutil.which("podman") or shutil.which("docker")
 
 
-DEFAULT_PROFILE = {
-    "allowlist": [],
-    "mounts": {
-        # example:
-        # ".config": "/root/.config"
-    },
-    "rebuild_triggers": [
-        "uv.lock",
-        "pyproject.toml",
-        "requirements.txt",
-        "requirements-dev.txt",
-        "package.json",
-        "package-lock.json",
-        "yarn.lock",
-    ],
-    # Files seeded into config/image/ — the Docker build context.
-    # Dockerfile is required; everything else is whatever the Dockerfile COPYs.
-    "image_files": {
-        "Dockerfile": """\
-FROM python:3.13-slim
 
-WORKDIR /workspace
+def load_profile(profile_dir: Path) -> dict:
+    """Load profile from a directory.
 
-RUN apt-get update && apt-get install -y --no-install-recommends \\
-    git curl ca-certificates ripgrep \\
-    && rm -rf /var/lib/apt/lists/*
-
-RUN pip install --no-cache-dir uv ruff ty
-
-COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
-ENTRYPOINT ["/entrypoint.sh"]
-CMD ["bash"]
-""",
-        "entrypoint.sh": """\
-#!/bin/bash
-set -e
-
-WORKSPACE=/llm-workspace
-GIT_MOUNT=/repo-git
-
-# Clone from the mounted .git if workspace is empty
-if [ ! -d "$WORKSPACE/.git" ]; then
-    echo "[sandbox] Cloning from host .git ..."
-    git clone --no-hardlinks "$GIT_MOUNT" "$WORKSPACE"
-    cd "$WORKSPACE"
-    git config user.email "agent@sandbox"
-    git config user.name "Agent"
-else
-    echo "[sandbox] Workspace already cloned."
-    cd "$WORKSPACE"
-fi
-
-echo "[sandbox] Ready. Repo: $(git log --oneline -1 2>/dev/null || echo 'empty')"
-exec "$@"
-""",
-    },
-}
-
-
-def load_profile(profile_dir: Path | None) -> dict:
-    """Load profile config for `up`. If profile_dir is None, return defaults.
-
-    A profile directory may contain:
-      config.json   — optional, keys: mounts (object), rebuild_triggers (array)
-      allowlist.txt — optional, one domain per line; replaces the default (empty) allowlist
-      image/        — optional, Docker build context; replaces the default image_files entirely
-                      Must contain a Dockerfile; any other files are available to COPY.
+    A profile directory must contain:
+      image/Dockerfile  — required, Docker build context
+      config.json       — required, keys: mounts (object), rebuild_triggers (array)
+    And may also contain:
+      image/*           — any other files the Dockerfile COPYs
+      allowlist.txt     — optional, one domain per line
     """
-    profile = copy.deepcopy(DEFAULT_PROFILE)
-    if profile_dir is None:
-        return profile
+    profile = {
+        "allowlist": [],
+    }
 
     profile_dir = profile_dir.resolve()
     if not profile_dir.exists():
-        die(f"--profile directory not found: {profile_dir}")
+        die(f"Profile directory not found: {profile_dir}")
     if not profile_dir.is_dir():
-        die(f"--profile must point to a directory: {profile_dir}")
+        die(f"Profile must be a directory: {profile_dir}")
+
+    image_dir = profile_dir / "image"
+    if not image_dir.exists():
+        die(f"Profile is missing image/ directory: {profile_dir}")
+    if not (image_dir / "Dockerfile").exists():
+        die(f"Profile image/ directory has no Dockerfile: {image_dir}")
+    profile["image_files"] = {
+        str(p.relative_to(image_dir)): p.read_text()
+        for p in image_dir.rglob("*") if p.is_file()
+    }
 
     config_path = profile_dir / "config.json"
-    if config_path.exists():
-        try:
-            cfg = json.loads(config_path.read_text())
-        except json.JSONDecodeError as e:
-            die(f"Invalid JSON in {config_path}: {e}")
-        if "mounts" in cfg:
-            if not isinstance(cfg["mounts"], dict):
-                die(f"{config_path}: 'mounts' must be a JSON object")
-            profile["mounts"] = cfg["mounts"]
-        if "rebuild_triggers" in cfg:
-            if not isinstance(cfg["rebuild_triggers"], list):
-                die(f"{config_path}: 'rebuild_triggers' must be a JSON array")
-            profile["rebuild_triggers"] = cfg["rebuild_triggers"]
+    if not config_path.exists():
+        die(f"Profile is missing config.json: {profile_dir}")
+    try:
+        cfg = json.loads(config_path.read_text())
+    except json.JSONDecodeError as e:
+        die(f"Invalid JSON in {config_path}: {e}")
+    if "mounts" not in cfg or not isinstance(cfg["mounts"], dict):
+        die(f"{config_path}: 'mounts' must be a JSON object")
+    if "rebuild_triggers" not in cfg or not isinstance(cfg["rebuild_triggers"], list):
+        die(f"{config_path}: 'rebuild_triggers' must be a JSON array")
+    profile["mounts"] = cfg["mounts"]
+    profile["rebuild_triggers"] = cfg["rebuild_triggers"]
 
     allowlist_path = profile_dir / "allowlist.txt"
     if allowlist_path.exists():
@@ -143,16 +93,8 @@ def load_profile(profile_dir: Path | None) -> dict:
             if line.strip() and not line.startswith("#")
         ]
 
-    image_dir = profile_dir / "image"
-    if image_dir.exists():
-        if not (image_dir / "Dockerfile").exists():
-            die(f"Profile image/ dir found but contains no Dockerfile: {image_dir}")
-        profile["image_files"] = {
-            str(p.relative_to(image_dir)): p.read_text()
-            for p in image_dir.rglob("*") if p.is_file()
-        }
-
     return profile
+
 
 # ---------------------------------------------------------------------------
 # Sandbox dataclass
@@ -606,7 +548,7 @@ def _provision(sb: Sandbox):
         return
 
     print(f"[provision] First-time setup for '{sb.name}' ...")
-    profile = sb.profile or copy.deepcopy(DEFAULT_PROFILE)
+    profile = sb.profile
 
     sb.meta_dir.mkdir(parents=True, exist_ok=True)
     sb.workspace_dir.mkdir(parents=True, exist_ok=True)
@@ -946,7 +888,7 @@ def main():
             profile_dir = Path.cwd() / ".sandbox-profile"
             print(f"[profile] Using .sandbox-profile from {Path.cwd()}")
         else:
-            profile_dir = None
+            die("No profile found. Run `sandbox init` to create a .sandbox-profile in this directory.")
         sb.profile = load_profile(profile_dir)
         sb.profile_explicit = bool(args.profile)
         up(sb, force_rebuild=args.rebuild or args.no_cache, no_cache=args.no_cache)
