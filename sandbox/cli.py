@@ -110,7 +110,6 @@ class Sandbox:
     # profile is only used during first-time provisioning (_provision).
     # After that, seeded files on disk are the source of truth.
     profile: dict | None = None
-    profile_explicit: bool = False
 
     # --- Paths ---------------------------------------------------
 
@@ -169,11 +168,6 @@ class Sandbox:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(json.dumps(meta, indent=2))
 
-    def update_meta(self, patch: dict):
-        meta = self.load_meta()
-        meta.update(patch)
-        self.save_meta(meta)
-
     # --- Alternative constructor ------------------------------------------
 
     @classmethod
@@ -192,13 +186,6 @@ class Sandbox:
 # Per-sandbox file helpers (operate on seeded files in meta_dir)
 # ---------------------------------------------------------------------------
 
-def resolve_dockerfile(sb: Sandbox) -> Path:
-    """Return the seeded Dockerfile path, dying if missing."""
-    if not sb.dockerfile_path.exists():
-        die(f"Dockerfile not found at {sb.dockerfile_path}. Instance may be corrupted — re-run `up`.")
-    return sb.dockerfile_path
-
-
 def load_config(sb: Sandbox) -> dict:
     """Load and validate config.json. Dies on missing file or invalid JSON."""
     if not sb.config_file.exists():
@@ -210,7 +197,6 @@ def load_config(sb: Sandbox) -> dict:
 
 
 def load_mounts(sb: Sandbox) -> dict:
-    """Load mount mappings from seeded config.json."""
     cfg = load_config(sb)
     if "mounts" not in cfg:
         die(f"config.json at {sb.config_file} is missing 'mounts' key. Instance may be corrupted — re-run `up`.")
@@ -428,11 +414,12 @@ def build_image(sb: Sandbox, no_cache=False) -> None:
     live changes to the repo never bleed into the image. Use `inject` in config.json
     to pull specific files from the repo into the build context at provision/replace time.
     """
-    dockerfile = resolve_dockerfile(sb)
+    if not sb.dockerfile_path.exists():
+        die(f"Dockerfile not found at {sb.dockerfile_path}. Instance may be corrupted — re-run `up`.")
 
     print(f"[image] Building {sb.image_tag}{' [no-cache]' if no_cache else ''} ...")
-    print(f"[image] Dockerfile: {dockerfile}")
-    cmd = [DOCKER, "build", "-t", sb.image_tag, "-f", str(dockerfile)]
+    print(f"[image] Dockerfile: {sb.dockerfile_path}")
+    cmd = [DOCKER, "build", "-t", sb.image_tag, "-f", str(sb.dockerfile_path)]
     if no_cache:
         cmd.append("--no-cache")
     # Build context is image/ — only seeded and injected files are visible to the Dockerfile.
@@ -566,9 +553,6 @@ def _copy_inject_files(sb: Sandbox, profile: dict):
 def _provision(sb: Sandbox):
     """Seed instance files on first creation only. Idempotent: no-ops if already provisioned."""
     if sb.meta_dir.exists():
-        if sb.profile_explicit:
-            print(f"[template] Instance '{sb.name}' already exists — ignoring --template to protect manual edits.")
-            print(f"           To re-seed from template, run: sandbox replace --name {sb.name}")
         return
 
     print(f"[provision] First-time setup for '{sb.name}' ...")
@@ -792,9 +776,10 @@ def status():
 
 
 def edit_dockerfile(sb: Sandbox):
-    dockerfile = resolve_dockerfile(sb)
+    if not sb.dockerfile_path.exists():
+        die(f"Dockerfile not found at {sb.dockerfile_path}. Instance may be corrupted — re-run `up`.")
 
-    if edit_file(dockerfile):
+    if edit_file(sb.dockerfile_path):
         print("[ed] Dockerfile changed, rebuilding ...")
         was_running = container_running(sb.container_name)
         try:
@@ -819,7 +804,7 @@ def edit_mounts(sb: Sandbox):
         print("[mounts] No changes.")
         return
 
-    load_config(sb)  # validates JSON after editing
+    load_mounts(sb)  # validates JSON after editing
 
     print("[mounts] Config updated.")
     if container_running(sb.container_name):
@@ -932,7 +917,6 @@ def main():
             template_dir = None
         if template_dir:
             sb.profile = load_profile(template_dir)
-            sb.profile_explicit = bool(args.template)
         up(sb, no_cache=args.no_cache)
     elif args.command == "restart":
         sb = resolve_sandbox(args)
