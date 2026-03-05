@@ -6,6 +6,7 @@ All infrastructure (network, squid proxy) is created if not present — idempote
 Default sandbox name is derived from the repo directory name.
 
 TODO:
+  - In defaults, add commented examples for how to install packages in image, and for allowlist
   - Add `--pull` flag to `up` to refresh the base image before rebuilding (for OS/base updates)
   - Orphaned volume dirs in workspaces flagged in `status` but not cleaned automatically;
     consider an `sandbox.py prune` command
@@ -33,22 +34,16 @@ _REPO_DEFAULT = "__repo__"  # sentinel: derive name from repo dir
 # ---------------------------------------------------------------------------
 
 SANDBOX_HOME = Path.home() / ".sandbox"
-INSTANCES_DIR = SANDBOX_HOME / "instances"
-WORKSPACES_DIR = SANDBOX_HOME / "workspaces"
-STATE_DIR = SANDBOX_HOME / "state"
 
 NETWORK_NAME = "sandbox-net"
-SQUID_CONTAINER_NAME = "sandbox-squid"
 SQUID_IMAGE = "ubuntu/squid:latest"
 SQUID_PORT = 3128
-
-DEFAULT_ALLOWLIST = [
-]
 
 DOCKER = shutil.which("podman") or shutil.which("docker")
 
 
 DEFAULT_PROFILE = {
+    "allowlist": [],
     "dockerfile": """\
 FROM python:3.13-slim
 
@@ -108,6 +103,7 @@ def load_profile(profile_dir: Path | None) -> dict:
       config.json   — optional, keys: mounts (object), rebuild_triggers (array)
       Dockerfile    — optional, replaces the default image definition
       entrypoint.sh — optional, replaces the default container entrypoint
+      allowlist.txt — optional, one domain per line; replaces the default (empty) allowlist
     """
     profile = copy.deepcopy(DEFAULT_PROFILE)
     if profile_dir is None:
@@ -142,6 +138,13 @@ def load_profile(profile_dir: Path | None) -> dict:
     if entrypoint_path.exists():
         profile["entrypoint_script"] = entrypoint_path.read_text()
 
+    allowlist_path = profile_dir / "allowlist.txt"
+    if allowlist_path.exists():
+        profile["allowlist"] = [
+            line.strip() for line in allowlist_path.read_text().splitlines()
+            if line.strip() and not line.startswith("#")
+        ]
+
     return profile
 
 # ---------------------------------------------------------------------------
@@ -160,16 +163,28 @@ class Sandbox:
     # --- Paths ---------------------------------------------------
 
     @property
+    def sandbox_dir(self) -> Path:
+        return SANDBOX_HOME / self.name
+
+    @property
     def meta_dir(self) -> Path:
-        return INSTANCES_DIR / self.name
+        return self.sandbox_dir / "config"
 
     @property
     def workspace_dir(self) -> Path:
-        return WORKSPACES_DIR / self.name
+        return self.sandbox_dir / "workspace"
 
     @property
     def state_dir(self) -> Path:
-        return STATE_DIR / self.name
+        return self.sandbox_dir / "volumes"
+
+    @property
+    def squid_container_name(self) -> str:
+        return f"sandbox-squid-{self.name}"
+
+    @property
+    def allowlist_path(self) -> Path:
+        return self.meta_dir / "allowlist.txt"
 
     @property
     def container_name(self) -> str:
@@ -211,7 +226,7 @@ class Sandbox:
 
     @classmethod
     def load(cls, name: str) -> "Sandbox":
-        meta_path = INSTANCES_DIR / name / "meta.json"
+        meta_path = SANDBOX_HOME / name / "config" / "meta.json"
         if not meta_path.exists():
             die(f"No meta found for sandbox '{name}'. Has it been created with `up`?")
         meta = json.loads(meta_path.read_text())
@@ -269,7 +284,7 @@ def resolve_sandbox(args) -> "Sandbox":
         return Sandbox(name=name, repo=repo)
 
     if name_arg != _REPO_DEFAULT:
-        meta_path = INSTANCES_DIR / name_arg / "meta.json"
+        meta_path = SANDBOX_HOME / name_arg / "config" / "meta.json"
         if meta_path.exists():
             return Sandbox.load(name_arg)
         try:
@@ -358,8 +373,8 @@ def edit_file(path: Path) -> bool:
 # Squid config generation
 # ---------------------------------------------------------------------------
 
-def write_squid_conf(allowlist: list[str]) -> Path:
-    conf_dir = SANDBOX_HOME / "squid"
+def write_squid_conf(sb: Sandbox, allowlist: list[str]) -> Path:
+    conf_dir = sb.meta_dir / "squid"
     conf_dir.mkdir(parents=True, exist_ok=True)
     acl_lines = "\n".join(f"acl allowed_domains dstdomain .{d}" for d in allowlist)
     conf = f"""\
@@ -398,22 +413,29 @@ def ensure_network():
     run([DOCKER, "network", "create", NETWORK_NAME])
 
 
-def ensure_squid(allowlist: list[str] = None):
-    allowlist = allowlist or DEFAULT_ALLOWLIST
+def load_sandbox_allowlist(sb: Sandbox) -> list[str]:
+    if not sb.allowlist_path.exists():
+        return []
+    return [line.strip() for line in sb.allowlist_path.read_text().splitlines()
+            if line.strip() and not line.startswith("#")]
 
-    if container_running(SQUID_CONTAINER_NAME):
-        print(f"[squid] {SQUID_CONTAINER_NAME} already running.")
+
+def ensure_squid(sb: Sandbox):
+    allowlist = load_sandbox_allowlist(sb)
+
+    if container_running(sb.squid_container_name):
+        print(f"[squid] {sb.squid_container_name} already running.")
         return
 
-    if container_exists(SQUID_CONTAINER_NAME):
-        print("[squid] Removing stopped squid container ...")
-        run([DOCKER, "rm", SQUID_CONTAINER_NAME])
+    if container_exists(sb.squid_container_name):
+        print(f"[squid] Removing stopped squid container {sb.squid_container_name} ...")
+        run([DOCKER, "rm", sb.squid_container_name])
 
-    conf_dir = write_squid_conf(allowlist)
-    print("[squid] Starting squid proxy ...")
+    conf_dir = write_squid_conf(sb, allowlist)
+    print(f"[squid] Starting {sb.squid_container_name} ...")
     run([
         DOCKER, "run", "-d",
-        "--name", SQUID_CONTAINER_NAME,
+        "--name", sb.squid_container_name,
         "--network", NETWORK_NAME,
         "--restart", "unless-stopped",
         "-v", f"{conf_dir}/squid.conf:/etc/squid/squid.conf:ro",
@@ -422,45 +444,31 @@ def ensure_squid(allowlist: list[str] = None):
 
 
 # ---------------------------------------------------------------------------
-# Global allowlist editor
+# Per-sandbox allowlist editor
 # ---------------------------------------------------------------------------
 
-GLOBAL_ALLOWLIST_FILE = SANDBOX_HOME / "allowlist.txt"
 
-
-def load_global_allowlist() -> list[str]:
-    if not GLOBAL_ALLOWLIST_FILE.exists():
-        return list(DEFAULT_ALLOWLIST)
-    return [line.strip() for line in GLOBAL_ALLOWLIST_FILE.read_text().splitlines()
-            if line.strip() and not line.startswith("#")]
-
-
-def reconfigure_squid(allowlist: list[str]):
-    write_squid_conf(allowlist)
-    if not container_running(SQUID_CONTAINER_NAME):
+def reconfigure_squid(sb: Sandbox):
+    allowlist = load_sandbox_allowlist(sb)
+    write_squid_conf(sb, allowlist)
+    if not container_running(sb.squid_container_name):
         print("[squid] Not running — config saved, will apply on next start.")
         return
-    print("[squid] Restarting squid ...")
-    run([DOCKER, "restart", SQUID_CONTAINER_NAME])
+    print(f"[squid] Restarting {sb.squid_container_name} ...")
+    run([DOCKER, "restart", sb.squid_container_name])
 
 
-def edit_allowlist():
-    SANDBOX_HOME.mkdir(parents=True, exist_ok=True)
-    # Seed the file with the header comment only on first creation.
-    # Never overwrite before editing — that would dirty mtime even on no-op edits.
-    if not GLOBAL_ALLOWLIST_FILE.exists():
-        GLOBAL_ALLOWLIST_FILE.write_text(
-            "# Global squid allowlist (one domain per line, # = comment)\n"
-            + "".join(d + "\n" for d in load_global_allowlist())
-        )
+def edit_allowlist(sb: Sandbox):
+    if not sb.allowlist_path.exists():
+        die(f"allowlist.txt not found at {sb.allowlist_path}. Instance may be corrupted — re-run `up`.")
 
-    if not edit_file(GLOBAL_ALLOWLIST_FILE):
+    if not edit_file(sb.allowlist_path):
         print("[allowlist] No changes.")
         return
 
-    allowlist = load_global_allowlist()
+    allowlist = load_sandbox_allowlist(sb)
     print(f"[allowlist] {len(allowlist)} domain(s) saved; reconfiguring squid ...")
-    reconfigure_squid(allowlist)
+    reconfigure_squid(sb)
 
 
 # ---------------------------------------------------------------------------
@@ -556,33 +564,40 @@ def wait_for_clone(sb: Sandbox, timeout=60):
 
 
 def _ensure_infra():
-    """Preflight: bring up shared network and squid proxy if not already running."""
+    """Preflight: bring up shared network if not already present."""
     ensure_network()
-    ensure_squid(load_global_allowlist())
 
 
 def up(sb: Sandbox, force_rebuild=False, no_cache=False, explicit_dockerfile: str = None):
     print(f"\n=== sandbox up: {sb.name} ===\n")
 
+    is_new = not sb.meta_dir.exists()
+
     _ensure_infra()
-    _provision(sb)
+    try:
+        _provision(sb)
 
-    # Build image — may raise; image_needs_rebuild is a pure read.
-    needs_rebuild, image_hash = image_needs_rebuild(sb, force=force_rebuild)
-    if needs_rebuild:
-        build_image(sb, image_hash, no_cache=no_cache, explicit_dockerfile=explicit_dockerfile)
-        sb.update_meta({"image_hash": image_hash})
+        # Build image — may raise; image_needs_rebuild is a pure read.
+        needs_rebuild, image_hash = image_needs_rebuild(sb, force=force_rebuild)
+        if needs_rebuild:
+            build_image(sb, image_hash, no_cache=no_cache, explicit_dockerfile=explicit_dockerfile)
+            sb.update_meta({"image_hash": image_hash})
 
-    if container_running(sb.container_name):
-        print(f"[container] {sb.container_name} is already running.")
-        setup_git_remotes(sb)
-        return
+        if container_running(sb.container_name):
+            print(f"[container] {sb.container_name} is already running.")
+            setup_git_remotes(sb)
+            return
 
-    if container_exists(sb.container_name):
-        print(f"[container] Removing stopped container {sb.container_name} ...")
-        run([DOCKER, "rm", sb.container_name], check=False, capture=True)
+        if container_exists(sb.container_name):
+            print(f"[container] Removing stopped container {sb.container_name} ...")
+            run([DOCKER, "rm", sb.container_name], check=False, capture=True)
 
-    _start(sb)
+        _start(sb)
+    except Exception:
+        if is_new:
+            print(f"\n[up] First-time setup failed — rolling back '{sb.name}' ...")
+            _unprovision(sb)
+        raise
 
 
 def _provision(sb: Sandbox):
@@ -611,6 +626,13 @@ def _provision(sb: Sandbox):
     sb.entrypoint_path.chmod(0o755)
     print(f"[provision] Wrote {sb.entrypoint_path}")
 
+    allowlist = profile.get("allowlist", [])
+    sb.allowlist_path.write_text(
+        "# Squid allowlist — one domain per line, # = comment\n"
+        + "".join(d + "\n" for d in allowlist)
+    )
+    print(f"[provision] Wrote {sb.allowlist_path}")
+
     sb.save_meta({
         "sandbox_name": sb.name,
         "repo": str(sb.repo),
@@ -626,7 +648,9 @@ def _start(sb: Sandbox):
     if not sb.entrypoint_path.exists():
         die(f"entrypoint.sh not found at {sb.entrypoint_path}. Was the instance provisioned?")
 
-    proxy_url = f"http://{SQUID_CONTAINER_NAME}:{SQUID_PORT}"
+    ensure_squid(sb)
+
+    proxy_url = f"http://{sb.squid_container_name}:{SQUID_PORT}"
     git_dir = sb.repo / ".git"
 
     docker_cmd = [
@@ -682,51 +706,65 @@ def down(sb: Sandbox):
     else:
         print(f"[container] {sb.container_name} not found.")
 
+    if container_running(sb.squid_container_name):
+        print(f"[squid] Stopping {sb.squid_container_name} ...")
+        run([DOCKER, "stop", "-t", "0", sb.squid_container_name], check=False, capture=True)
+    if container_exists(sb.squid_container_name):
+        run([DOCKER, "rm", "-f", sb.squid_container_name], check=False, capture=True)
 
-def destroy(sb: Sandbox):
-    """Remove all cheap/dangling resources. Workspace and state dirs are left intact."""
-    down(sb)
-    if image_exists(sb.image_tag):
-        print(f"[image] Removing {sb.image_tag} ...")
-        run([DOCKER, "rmi", sb.image_tag], check=False)
 
+def _unprovision(sb: Sandbox):
+    """Tear down all per-sandbox runtime resources and seeded files.
+    Safe to call at any point — all steps are best-effort.
+    Does NOT remove the image (expensive, may be reused on retry).
+    """
+    # Stop/remove main container
+    if container_running(sb.container_name):
+        run([DOCKER, "stop", "-t", "0", sb.container_name], check=False, capture=True)
+    if container_exists(sb.container_name):
+        run([DOCKER, "rm", "-f", sb.container_name], check=False, capture=True)
+
+    # Stop/remove squid container
+    if container_running(sb.squid_container_name):
+        run([DOCKER, "stop", "-t", "0", sb.squid_container_name], check=False, capture=True)
+    if container_exists(sb.squid_container_name):
+        run([DOCKER, "rm", "-f", sb.squid_container_name], check=False, capture=True)
+
+    # Remove git remote on host (may or may not have been added)
     remote_name = f"agent-{sb.name}"
     r = run(["git", "-C", str(sb.repo), "remote"], capture=True, check=False)
     if remote_name in r.stdout.splitlines():
         print(f"[git] Removing host remote '{remote_name}' ...")
         run(["git", "-C", str(sb.repo), "remote", "remove", remote_name], check=False)
 
-    if sb.meta_dir.exists():
-        shutil.rmtree(sb.meta_dir)
+    # Remove seeded dirs — workspace and volumes sit under sandbox_dir too
+    if sb.sandbox_dir.exists():
+        shutil.rmtree(sb.sandbox_dir)
+
+
+def destroy(sb: Sandbox):
+    """Remove all resources. To fully nuke: rm -rf ~/.sandbox/{name}"""
+    _unprovision(sb)
+
+    if image_exists(sb.image_tag):
+        print(f"[image] Removing {sb.image_tag} ...")
+        run([DOCKER, "rmi", sb.image_tag], check=False)
 
     print(f"[destroy] {sb.name} destroyed.")
-    print(f"  Workspace and state preserved — remove manually if needed:")
-    print(f"    rm -rf {sb.workspace_dir} {sb.state_dir}")
+    print(f"  To fully remove all data: rm -rf {sb.sandbox_dir}")
 
 
 def infra_down():
-    errors = False
-
-    if container_exists(SQUID_CONTAINER_NAME):
-        print(f"[infra] Removing {SQUID_CONTAINER_NAME} ...")
-        run([DOCKER, "stop", "-t", "0", SQUID_CONTAINER_NAME], check=False, capture=True)
-        r = run([DOCKER, "rm", "-f", SQUID_CONTAINER_NAME], check=False, capture=True)
-        if r.returncode != 0:
-            print(f"ERROR: Could not remove container {SQUID_CONTAINER_NAME}: {r.stderr.strip()}")
-            errors = True
-
     if network_exists(NETWORK_NAME):
         print(f"[infra] Removing network {NETWORK_NAME} ...")
         r = run([DOCKER, "network", "rm", NETWORK_NAME], check=False, capture=True)
         if r.returncode != 0:
-            print(f"ERROR: Could not remove network {NETWORK_NAME}.")
-            print("       It is likely still in use by running sandboxes.")
-            errors = True
-
-    if errors:
-        die("infra-down failed to clean up all resources.")
+            die(f"ERROR: Could not remove network {NETWORK_NAME}.\n"
+                "       It is likely still in use by running sandboxes.")
+        else:
+            print("[infra] Network removed successfully.")
     else:
-        print("[infra] Infrastructure removed successfully.")
+        print(f"[infra] Network {NETWORK_NAME} not found.")
 
 
 def status():
@@ -739,43 +777,43 @@ def status():
 
     print("\n=== Infrastructure ===")
     net_ok = "✓" if network_exists(NETWORK_NAME) else "✗"
-    print(f"  Network    : {net_ok} {NETWORK_NAME}")
-
-    sq_state = c_states.get(SQUID_CONTAINER_NAME, "absent")
-    print(f"  Squid Proxy: {sq_state}")
+    print(f"  Network: {net_ok} {NETWORK_NAME}")
 
     print("\n=== Sandboxes ===")
-    if not INSTANCES_DIR.exists():
+    if not SANDBOX_HOME.exists():
         print("  No sandboxes found.")
     else:
-        instances = sorted([d for d in INSTANCES_DIR.iterdir() if d.is_dir()])
+        instances = sorted([d for d in SANDBOX_HOME.iterdir() if d.is_dir() and (d / "config" / "meta.json").exists()])
         if not instances:
             print("  No sandboxes found.")
         else:
             for d in instances:
                 name = d.name
-                meta_path = d / "meta.json"
-                meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+                meta_path = d / "config" / "meta.json"
+                meta = json.loads(meta_path.read_text())
 
                 repo_str = meta.get("repo", "Unknown")
 
                 container_name = f"sandbox-{name}"
                 state = c_states.get(container_name, "no container")
 
-                df = d / "Dockerfile"
+                squid_name = f"sandbox-squid-{name}"
+                squid_state = c_states.get(squid_name, "no container")
+
+                df = d / "config" / "Dockerfile"
                 df_info = str(df) if df.exists() else "None found"
 
                 print(f"  Sandbox: {name}")
                 print(f"    State     : {state}")
+                print(f"    Squid     : {squid_state}")
                 print(f"    Repo      : {repo_str}")
                 print(f"    Dockerfile: {df_info}")
                 print()
 
-    if WORKSPACES_DIR.exists():
-        known_names = {d.name for d in INSTANCES_DIR.iterdir()} if INSTANCES_DIR.exists() else set()
-        orphans = [d for d in WORKSPACES_DIR.iterdir() if d.is_dir() and d.name not in known_names]
+    if SANDBOX_HOME.exists():
+        orphans = [d for d in SANDBOX_HOME.iterdir() if d.is_dir() and not (d / "config" / "meta.json").exists()]
         if orphans:
-            print("=== Orphans (Workspaces without metadata) ===")
+            print("=== Orphans (dirs without config/meta.json) ===")
             for o in orphans:
                 print(f"  {o}")
             print("  (Safe to delete manually or use prune when implemented)\n")
@@ -856,8 +894,10 @@ def parse_args():
     p_destroy.add_argument("--name", "-n", default=_REPO_DEFAULT)
 
     sub.add_parser("status", help="Show all sandboxes and infrastructure")
-    sub.add_parser("infra-down", help="Tear down shared squid container and network")
-    sub.add_parser("edit-allowlist", aliases=["ea"])
+    sub.add_parser("infra-down", help="Tear down shared network")
+
+    p_ea = sub.add_parser("edit-allowlist", aliases=["ea"])
+    p_ea.add_argument("--name", "-n", default=_REPO_DEFAULT)
 
     p_ed = sub.add_parser("edit-dockerfile", aliases=["ed"])
     p_ed.add_argument("--name", "-n", default=_REPO_DEFAULT)
@@ -898,7 +938,8 @@ def main():
     elif args.command == "infra-down":
         infra_down()
     elif args.command in ("edit-allowlist", "ea"):
-        edit_allowlist()
+        sb = resolve_sandbox(args)
+        edit_allowlist(sb)
     elif args.command in ("edit-dockerfile", "ed"):
         sb = resolve_sandbox(args)
         edit_dockerfile(sb)
