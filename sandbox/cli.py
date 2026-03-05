@@ -853,6 +853,25 @@ def edit_mounts(sb: Sandbox):
             up(sb)
 
 
+def cmd_init(profile_name: str):
+    dest = Path.cwd() / ".sandbox-profile"
+    if dest.exists():
+        die(f".sandbox-profile already exists in {Path.cwd()}. Remove it first to reinitialise.")
+
+    profiles_dir = Path(__file__).parent / "profiles"
+    if not profiles_dir.exists():
+        die(f"Profiles directory not found at {profiles_dir}. Is the package installed correctly?")
+
+    profile_dir = profiles_dir / profile_name
+    if not profile_dir.exists():
+        available = [d.name for d in profiles_dir.iterdir() if d.is_dir()]
+        die(f"Profile '{profile_name}' not found. Available: {', '.join(sorted(available))}")
+
+    shutil.copytree(profile_dir, dest)
+    print(f"[init] Initialised .sandbox-profile from profile '{profile_name}' in {Path.cwd()}")
+    print(f"  Edit {dest} to customise, then run: sandbox up")
+
+
 def exec_cmd(sb: Sandbox, cmd: list[str]):
     if not container_running(sb.container_name):
         die(f"{sb.container_name} is not running. Run `sandbox.py up --name {sb.name}` first.")
@@ -872,6 +891,9 @@ def parse_args():
     )
     parser.add_argument("--docker", metavar="BIN", help="Override docker/podman binary")
     sub = parser.add_subparsers(dest="command", required=True)
+
+    p_init = sub.add_parser("init", help="Initialise .sandbox-profile in current directory from a profile")
+    p_init.add_argument("profile_name", nargs="?", default="default", metavar="PROFILE")
 
     p_up = sub.add_parser("up", help="Create/start sandbox (idempotent)")
     p_up.add_argument("--name", "-n", default=_REPO_DEFAULT)
@@ -914,9 +936,18 @@ def main():
     if not DOCKER:
         die("Neither podman nor docker found in PATH. Install one or use --docker.")
 
-    if args.command == "up":
+    if args.command == "init":
+        cmd_init(args.profile_name)
+    elif args.command == "up":
         sb = resolve_sandbox(args)
-        sb.profile = load_profile(Path(args.profile)) if args.profile else load_profile(None)
+        if args.profile:
+            profile_dir = Path(args.profile)
+        elif (Path.cwd() / ".sandbox-profile").is_dir():
+            profile_dir = Path.cwd() / ".sandbox-profile"
+            print(f"[profile] Using .sandbox-profile from {Path.cwd()}")
+        else:
+            profile_dir = None
+        sb.profile = load_profile(profile_dir)
         sb.profile_explicit = bool(args.profile)
         up(sb, force_rebuild=args.rebuild or args.no_cache, no_cache=args.no_cache)
     elif args.command == "down":

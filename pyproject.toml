@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sandbox"
+version = "0.1.0"
+description = "Dev sandbox container manager (podman/docker)"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+sandbox = "sandbox.cli:main"
