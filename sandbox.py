@@ -2,14 +2,14 @@
 """
 sandbox.py — Dev sandbox container manager (podman/docker, docker-compose-free)
 
-All infrastructure (network, squid proxy) is created if not present — idempotent.
+Network infrastructure is created if not present — idempotent.
+Each sandbox gets its own squid proxy, started and stopped with the container.
 Default sandbox name is derived from the repo directory name.
 
 TODO:
   - In defaults, add commented examples for how to install packages in image, and for allowlist
   - Add `--pull` flag to `up` to refresh the base image before rebuilding (for OS/base updates)
-  - Orphaned volume dirs in workspaces flagged in `status` but not cleaned automatically;
-    consider an `sandbox.py prune` command
+  - Consider a `sandbox.py prune` command to automatically remove orphaned sandbox dirs under ~/.sandbox/
   - On `up`, add cli prompt to set git username and email. Default to values from repo, but allow changing them.
   - Warn or error on `up` if the same --name is reused across different repos
     (currently only catches this if meta already exists)
@@ -247,13 +247,8 @@ class Sandbox:
 # Per-sandbox file helpers (operate on seeded files in meta_dir)
 # ---------------------------------------------------------------------------
 
-def resolve_dockerfile(sb: Sandbox, explicit_dockerfile: str = None) -> Path:
-    """Resolve Dockerfile: explicit path if given, otherwise the seeded instance default."""
-    if explicit_dockerfile:
-        p = Path(explicit_dockerfile).resolve()
-        if not p.exists():
-            raise FileNotFoundError(f"--dockerfile not found: {p}")
-        return p
+def resolve_dockerfile(sb: Sandbox) -> Path:
+    """Return the seeded Dockerfile path, dying if missing."""
     if not sb.dockerfile_path.exists():
         die(f"Dockerfile not found at {sb.dockerfile_path}. Instance may be corrupted — re-run `up`.")
     return sb.dockerfile_path
@@ -509,9 +504,9 @@ def image_needs_rebuild(sb: Sandbox, force: bool) -> tuple[bool, str]:
     return True, current_hash
 
 
-def build_image(sb: Sandbox, current_hash: str, no_cache=False, explicit_dockerfile: str = None) -> None:
+def build_image(sb: Sandbox, current_hash: str, no_cache=False) -> None:
     """Unconditionally build the image."""
-    dockerfile = resolve_dockerfile(sb, explicit_dockerfile=explicit_dockerfile)
+    dockerfile = resolve_dockerfile(sb)
 
     print(f"[image] Building {sb.image_tag} (trigger hash: {current_hash}){' [no-cache]' if no_cache else ''} ...")
     print(f"[image] Dockerfile: {dockerfile}")
@@ -570,24 +565,19 @@ def wait_for_clone(sb: Sandbox, timeout=60):
     return False
 
 
-def _ensure_infra():
-    """Preflight: bring up shared network if not already present."""
-    ensure_network()
-
-
-def up(sb: Sandbox, force_rebuild=False, no_cache=False, explicit_dockerfile: str = None):
+def up(sb: Sandbox, force_rebuild=False, no_cache=False):
     print(f"\n=== sandbox up: {sb.name} ===\n")
 
     is_new = not sb.meta_dir.exists()
 
-    _ensure_infra()
+    ensure_network()
     try:
         _provision(sb)
 
         # Build image — may raise; image_needs_rebuild is a pure read.
         needs_rebuild, image_hash = image_needs_rebuild(sb, force=force_rebuild)
         if needs_rebuild:
-            build_image(sb, image_hash, no_cache=no_cache, explicit_dockerfile=explicit_dockerfile)
+            build_image(sb, image_hash, no_cache=no_cache)
             sb.update_meta({"image_hash": image_hash})
 
         if container_running(sb.container_name):
@@ -643,9 +633,6 @@ def _provision(sb: Sandbox):
     sb.save_meta({
         "sandbox_name": sb.name,
         "repo": str(sb.repo),
-        "workspace_dir": str(sb.workspace_dir),
-        "state_dir": str(sb.state_dir),
-        "container": sb.container_name,
     })
     print(f"[provision] Instance '{sb.name}' provisioned.")
 
@@ -688,7 +675,7 @@ def _start(sb: Sandbox):
 
     print(f"\n[container] {sb.container_name} is up.")
     print(f"  Workspace : {sb.workspace_dir}")
-    print(f"  State     : {sb.state_dir}")
+    print(f"  Volumes   : {sb.state_dir}")
     print(f"  Proxy     : {proxy_url}")
 
     if wait_for_clone(sb):
@@ -892,7 +879,6 @@ def parse_args():
     p_up.add_argument("--profile", default=None, metavar="DIR")
     p_up.add_argument("--rebuild", action="store_true")
     p_up.add_argument("--no-cache", dest="no_cache", action="store_true")
-    p_up.add_argument("--dockerfile", default=None, metavar="PATH")
 
     p_down = sub.add_parser("down", help="Stop sandbox container (keep volumes/image)")
     p_down.add_argument("--name", "-n", default=_REPO_DEFAULT)
@@ -932,8 +918,7 @@ def main():
         sb = resolve_sandbox(args)
         sb.profile = load_profile(Path(args.profile)) if args.profile else load_profile(None)
         sb.profile_explicit = bool(args.profile)
-        up(sb, force_rebuild=args.rebuild or args.no_cache, no_cache=args.no_cache,
-           explicit_dockerfile=args.dockerfile)
+        up(sb, force_rebuild=args.rebuild or args.no_cache, no_cache=args.no_cache)
     elif args.command == "down":
         sb = resolve_sandbox(args)
         down(sb)
