@@ -7,20 +7,6 @@ Each sandbox gets its own squid proxy, started and stopped with the container.
 Default sandbox name is derived from the repo directory name.
 
 TODO:
-  - Remove rebuild_triggers system entirely. Currently sandbox hashes a list of files
-    (uv.lock, requirements.txt, pyproject.toml etc.) alongside the Dockerfile to decide
-    whether to rebuild the image on `up`. This is redundant: Docker's own layer caching
-    already handles this correctly — if a COPYed file changes, Docker invalidates from
-    that layer forward; if it hasn't changed, the cached layer is reused. The rebuild_triggers
-    list only matters for files that influence the build but aren't COPYed, which is an
-    unusual/broken Dockerfile pattern not worth supporting. Removal scope:
-      - `rebuild_triggers` key from profile config.json and load_profile()
-      - `image_needs_rebuild()` function
-      - `image_hash` storage in meta.json / update_meta() calls
-      - `--rebuild` and `--no-cache` flags on `up` (or keep --no-cache as a passthrough to docker build)
-      - `config.json` seeding in _provision() simplifies or disappears if mounts is the only remaining key
-    After removal, `sandbox up` always runs `docker build` and relies on Docker cache.
-    Net effect: simpler code, same behaviour for correct Dockerfiles.
   - Add `--pull` flag to `up` to refresh the base image before rebuilding (for OS/base updates)
   - Consider a `sandbox.py prune` command to automatically remove orphaned sandbox dirs under ~/.sandbox/
   - On `up`, add cli prompt to set git username and email. Default to values from repo, but allow changing them.
@@ -29,7 +15,6 @@ TODO:
 """
 
 import argparse
-import hashlib
 import json
 import os
 import shutil
@@ -60,7 +45,7 @@ def load_profile(profile_dir: Path) -> dict:
 
     A profile directory must contain:
       image/Dockerfile  — required, Docker build context
-      config.json       — required, keys: mounts (object), rebuild_triggers (array)
+      config.json       — required, keys: mounts (object)
     And may also contain:
       image/*           — any other files the Dockerfile COPYs
       allowlist.txt     — optional, one domain per line
@@ -94,10 +79,7 @@ def load_profile(profile_dir: Path) -> dict:
         die(f"Invalid JSON in {config_path}: {e}")
     if "mounts" not in cfg or not isinstance(cfg["mounts"], dict):
         die(f"{config_path}: 'mounts' must be a JSON object")
-    if "rebuild_triggers" not in cfg or not isinstance(cfg["rebuild_triggers"], list):
-        die(f"{config_path}: 'rebuild_triggers' must be a JSON array")
     profile["mounts"] = cfg["mounts"]
-    profile["rebuild_triggers"] = cfg["rebuild_triggers"]
 
     allowlist_path = profile_dir / "allowlist.txt"
     if allowlist_path.exists():
@@ -312,13 +294,6 @@ def die(msg: str):
     sys.exit(1)
 
 
-def hash_files(paths: list[Path]) -> str:
-    h = hashlib.sha256()
-    for p in sorted(paths):
-        if p.exists():
-            h.update(p.read_bytes())
-    return h.hexdigest()[:16]
-
 
 def edit_file(path: Path) -> bool:
     mtime_before = path.stat().st_mtime
@@ -432,43 +407,16 @@ def edit_allowlist(sb: Sandbox):
 # Image build
 # ---------------------------------------------------------------------------
 
-def image_needs_rebuild(sb: Sandbox, force: bool) -> tuple[bool, str]:
-    """Pure read: check whether the image needs to be rebuilt.
-
-    Hashes repo trigger files AND all files in image_dir (the build context),
-    so any manual edit to Dockerfile or any baked-in file triggers a rebuild.
-    config.json is excluded — mounts are a runtime concern with no bearing on image contents.
-    """
-    cfg = load_config(sb)
-    triggers = cfg.get("rebuild_triggers", [])
-    trigger_files = [sb.repo / f for f in triggers]
-    image_files = sorted(sb.image_dir.rglob("*")) if sb.image_dir.exists() else []
-    image_files = [p for p in image_files if p.is_file()]
-    current_hash = hash_files(trigger_files + image_files)
-
-    if force:
-        return True, current_hash
-
-    meta = sb.load_meta()
-    last_hash = meta.get("image_hash")
-
-    if image_exists(sb.image_tag) and last_hash == current_hash:
-        print(f"[image] {sb.image_tag} is up to date (hash {current_hash}).")
-        return False, current_hash
-
-    return True, current_hash
-
-
-def build_image(sb: Sandbox, current_hash: str, no_cache=False) -> None:
-    """Unconditionally build the image."""
+def build_image(sb: Sandbox, no_cache=False) -> None:
+    """Unconditionally build the image. Relies on Docker's layer cache."""
     dockerfile = resolve_dockerfile(sb)
 
-    print(f"[image] Building {sb.image_tag} (trigger hash: {current_hash}){' [no-cache]' if no_cache else ''} ...")
+    print(f"[image] Building {sb.image_tag}{' [no-cache]' if no_cache else ''} ...")
     print(f"[image] Dockerfile: {dockerfile}")
     cmd = [DOCKER, "build", "-t", sb.image_tag, "-f", str(dockerfile)]
     if no_cache:
         cmd.append("--no-cache")
-    cmd.append(str(sb.repo))
+    cmd.append(str(sb.image_dir))
     run(cmd)
 
 
@@ -520,7 +468,7 @@ def wait_for_clone(sb: Sandbox, timeout=60):
     return False
 
 
-def up(sb: Sandbox, force_rebuild=False, no_cache=False):
+def up(sb: Sandbox, no_cache=False):
     print(f"\n=== sandbox up: {sb.name} ===\n")
 
     is_new = not sb.meta_dir.exists()
@@ -529,11 +477,8 @@ def up(sb: Sandbox, force_rebuild=False, no_cache=False):
     try:
         _provision(sb)
 
-        # Build image — may raise; image_needs_rebuild is a pure read.
-        needs_rebuild, image_hash = image_needs_rebuild(sb, force=force_rebuild)
-        if needs_rebuild:
-            build_image(sb, image_hash, no_cache=no_cache)
-            sb.update_meta({"image_hash": image_hash})
+        # Always build — relies on Docker's layer cache for efficiency.
+        build_image(sb, no_cache=no_cache)
 
         if container_running(sb.container_name):
             print(f"[container] {sb.container_name} is already running.")
@@ -567,7 +512,7 @@ def _provision(sb: Sandbox):
     sb.workspace_dir.mkdir(parents=True, exist_ok=True)
     sb.state_dir.mkdir(parents=True, exist_ok=True)
 
-    config_data = {"mounts": profile["mounts"], "rebuild_triggers": profile["rebuild_triggers"]}
+    config_data = {"mounts": profile["mounts"]}
     sb.config_file.write_text(json.dumps(config_data, indent=2))
     print(f"[provision] Wrote {sb.config_file}")
 
@@ -783,9 +728,7 @@ def edit_dockerfile(sb: Sandbox):
         print("[ed] Dockerfile changed, rebuilding ...")
         was_running = container_running(sb.container_name)
         try:
-            _, new_hash = image_needs_rebuild(sb, force=True)
-            build_image(sb, new_hash)
-            sb.update_meta({"image_hash": new_hash})
+            build_image(sb)
         except Exception as e:
             print(f"[ed] Build failed: {e}")
             print(f"[ed] Container left {'running' if was_running else 'stopped'} — no restart.")
@@ -862,7 +805,6 @@ def parse_args():
     p_up.add_argument("--name", "-n", default=_REPO_DEFAULT)
     p_up.add_argument("--repo", "-r", default=None)
     p_up.add_argument("--profile", default=None, metavar="DIR")
-    p_up.add_argument("--rebuild", action="store_true")
     p_up.add_argument("--no-cache", dest="no_cache", action="store_true")
 
     p_down = sub.add_parser("down", help="Stop sandbox container (keep volumes/image)")
@@ -912,7 +854,7 @@ def main():
             die("No profile found. Run `sandbox init` to create a .sandbox-profile in this directory.")
         sb.profile = load_profile(profile_dir)
         sb.profile_explicit = bool(args.profile)
-        up(sb, force_rebuild=args.rebuild or args.no_cache, no_cache=args.no_cache)
+        up(sb, no_cache=args.no_cache)
     elif args.command == "down":
         sb = resolve_sandbox(args)
         down(sb)
