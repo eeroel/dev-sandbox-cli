@@ -484,9 +484,23 @@ def wait_for_clone(sb: Sandbox, timeout=60):
     return False
 
 
-def up(sb: Sandbox, no_cache=False):
+def resolve_template_dir(template_arg: str | None) -> Path | None:
+    """Resolve template directory from --template arg or .sandbox-template in cwd. Returns None if not found."""
+    if template_arg:
+        return Path(template_arg)
+    candidate = Path.cwd() / ".sandbox-template"
+    if candidate.is_dir():
+        print(f"[template] Using .sandbox-template from {Path.cwd()}")
+        return candidate
+    return None
+
+
+def up(sb: Sandbox, template_dir: Path | None = None, no_cache=False):
     """Provision (first time) and start the sandbox. No-op if already running."""
     print(f"\n=== sandbox up: {sb.name} ===\n")
+
+    if template_dir:
+        sb.template = load_template(template_dir)
 
     if not sb.meta_dir.exists() and sb.template is None:
         die("No existing sandbox found and no template provided. "
@@ -528,10 +542,12 @@ def restart(sb: Sandbox, no_cache=False):
     _start(sb)
 
 
-def replace(sb: Sandbox, no_cache=False):
+def replace(sb: Sandbox, template_dir: Path | None = None, no_cache=False):
     """Wipe meta, re-seed from template, rebuild image, restart. Volumes and workspace are preserved."""
     if not sb.meta_dir.exists():
         die(f"Sandbox '{sb.name}' has not been provisioned. Run `sandbox up` first.")
+    if template_dir:
+        sb.template = load_template(template_dir)
     if sb.template is None:
         die("No template provided. Run from a directory containing .sandbox-template, or use --template.")
     print(f"\n=== sandbox replace: {sb.name} ===\n")
@@ -916,56 +932,25 @@ def main():
     if not DOCKER:
         die("Neither podman nor docker found in PATH. Install one or use --docker.")
 
-    if args.command == "init":
-        cmd_init(args.template_name)
-    elif args.command == "up":
-        sb = resolve_sandbox(args)
-        if args.template:
-            template_dir = Path(args.template)
-        elif (Path.cwd() / ".sandbox-template").is_dir():
-            template_dir = Path.cwd() / ".sandbox-template"
-            print(f"[template] Using .sandbox-template from {Path.cwd()}")
-        else:
-            template_dir = None
-        if template_dir:
-            sb.template = load_template(template_dir)
-        up(sb, no_cache=args.no_cache)
-    elif args.command == "restart":
-        sb = resolve_sandbox(args)
-        restart(sb, no_cache=args.no_cache)
-    elif args.command == "replace":
-        sb = resolve_sandbox(args)
-        if args.template:
-            template_dir = Path(args.template)
-        elif (Path.cwd() / ".sandbox-template").is_dir():
-            template_dir = Path.cwd() / ".sandbox-template"
-            print(f"[template] Using .sandbox-template from {Path.cwd()}")
-        else:
-            die("No template found. Run from a directory containing .sandbox-template, or use --template.")
-        sb.template = load_template(template_dir)
-        replace(sb, no_cache=args.no_cache)
-    elif args.command == "down":
-        sb = resolve_sandbox(args)
-        down(sb)
-    elif args.command == "destroy":
-        sb = resolve_sandbox(args)
-        destroy(sb)
-    elif args.command == "status":
-        status()
-    elif args.command == "infra-down":
-        infra_down()
-    elif args.command in ("edit-allowlist", "ea"):
-        sb = resolve_sandbox(args)
-        edit_allowlist(sb)
-    elif args.command in ("edit-dockerfile", "ed"):
-        sb = resolve_sandbox(args)
-        edit_dockerfile(sb)
-    elif args.command in ("edit-mounts", "em"):
-        sb = resolve_sandbox(args)
-        edit_mounts(sb)
-    elif args.command == "exec":
-        sb = resolve_sandbox(args)
-        exec_cmd(sb, args.cmd)
+    sb = lambda: resolve_sandbox(args)
+    commands = {
+        "init":            lambda: cmd_init(args.template_name),
+        "up":              lambda: up(sb(), template_dir=resolve_template_dir(args.template), no_cache=args.no_cache),
+        "restart":         lambda: restart(sb(), no_cache=args.no_cache),
+        "replace":         lambda: replace(sb(), template_dir=resolve_template_dir(args.template), no_cache=args.no_cache),
+        "down":            lambda: down(sb()),
+        "destroy":         lambda: destroy(sb()),
+        "status":          lambda: status(),
+        "infra-down":      lambda: infra_down(),
+        "edit-allowlist":  lambda: edit_allowlist(sb()),
+        "ea":              lambda: edit_allowlist(sb()),
+        "edit-dockerfile": lambda: edit_dockerfile(sb()),
+        "ed":              lambda: edit_dockerfile(sb()),
+        "edit-mounts":     lambda: edit_mounts(sb()),
+        "em":              lambda: edit_mounts(sb()),
+        "exec":            lambda: exec_cmd(sb(), args.cmd),
+    }
+    commands[args.command]()
 
 if __name__ == "__main__":
     main()
