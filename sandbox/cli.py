@@ -32,7 +32,8 @@ _REPO_DEFAULT = "__repo__"  # sentinel: derive name from repo dir
 
 SANDBOX_HOME = Path.home() / ".sandbox"
 
-NETWORK_NAME = "sandbox-net"
+NETWORK_NAME = "sandbox-net"          # internal only — sandbox containers cannot reach internet directly
+EXTERNAL_NETWORK_NAME = "sandbox-external"  # squid gets this too, for actual internet access
 SQUID_IMAGE = "ubuntu/squid:latest"
 SQUID_PORT = 3128
 
@@ -332,11 +333,17 @@ cache_store_log none
 # ---------------------------------------------------------------------------
 
 def ensure_network():
-    if network_exists(NETWORK_NAME):
+    if not network_exists(NETWORK_NAME):
+        print(f"[network] Creating {NETWORK_NAME} (internal) ...")
+        run([DOCKER, "network", "create", "--internal", NETWORK_NAME])
+    else:
         print(f"[network] {NETWORK_NAME} already exists.")
-        return
-    print(f"[network] Creating {NETWORK_NAME} ...")
-    run([DOCKER, "network", "create", NETWORK_NAME])
+
+    if not network_exists(EXTERNAL_NETWORK_NAME):
+        print(f"[network] Creating {EXTERNAL_NETWORK_NAME} ...")
+        run([DOCKER, "network", "create", EXTERNAL_NETWORK_NAME])
+    else:
+        print(f"[network] {EXTERNAL_NETWORK_NAME} already exists.")
 
 
 def load_sandbox_allowlist(sb: Sandbox) -> list[str]:
@@ -368,6 +375,8 @@ def ensure_squid(sb: Sandbox):
         "-v", f"{conf_dir}/squid.conf:/etc/squid/squid.conf:ro",
         SQUID_IMAGE,
     ])
+    # Also connect squid to the external network so it can reach the internet.
+    run([DOCKER, "network", "connect", EXTERNAL_NETWORK_NAME, sb.squid_container_name])
 
 
 # ---------------------------------------------------------------------------
@@ -711,16 +720,17 @@ def destroy(sb: Sandbox):
 
 
 def infra_down():
-    if network_exists(NETWORK_NAME):
-        print(f"[infra] Removing network {NETWORK_NAME} ...")
-        r = run([DOCKER, "network", "rm", NETWORK_NAME], check=False, capture=True)
-        if r.returncode != 0:
-            die(f"ERROR: Could not remove network {NETWORK_NAME}.\n"
-                "       It is likely still in use by running sandboxes.")
+    for net in (NETWORK_NAME, EXTERNAL_NETWORK_NAME):
+        if network_exists(net):
+            print(f"[infra] Removing network {net} ...")
+            r = run([DOCKER, "network", "rm", net], check=False, capture=True)
+            if r.returncode != 0:
+                die(f"ERROR: Could not remove network {net}.\n"
+                    "       It is likely still in use by running sandboxes.")
+            else:
+                print(f"[infra] {net} removed.")
         else:
-            print("[infra] Network removed successfully.")
-    else:
-        print(f"[infra] Network {NETWORK_NAME} not found.")
+            print(f"[infra] Network {net} not found.")
 
 
 def status():
@@ -733,7 +743,9 @@ def status():
 
     print("\n=== Infrastructure ===")
     net_ok = "✓" if network_exists(NETWORK_NAME) else "✗"
-    print(f"  Network: {net_ok} {NETWORK_NAME}")
+    print(f"  Network (internal): {net_ok} {NETWORK_NAME}")
+    ext_ok = "✓" if network_exists(EXTERNAL_NETWORK_NAME) else "✗"
+    print(f"  Network (external): {ext_ok} {EXTERNAL_NETWORK_NAME}")
 
     print("\n=== Sandboxes ===")
     if not SANDBOX_HOME.exists():
