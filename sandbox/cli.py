@@ -221,16 +221,14 @@ def resolve_sandbox(args) -> "Sandbox":
         meta_path = SANDBOX_HOME / name_arg / "config" / "meta.json"
         if meta_path.exists():
             return Sandbox.load(name_arg)
-        try:
-            repo = repo_root()
-        except SystemExit:
+        repo = repo_root()
+        if repo is None:
             die(f"Sandbox '{name_arg}' not yet created and not inside a git repo. "
                 "Use --repo to specify the repo path.")
         return Sandbox(name=name_arg, repo=repo)
 
-    try:
-        repo = repo_root()
-    except SystemExit:
+    repo = repo_root()
+    if repo is None:
         die("Not inside a git repository. Use --repo or --name to specify the sandbox.")
     return Sandbox(name=repo.name, repo=repo)
 
@@ -277,11 +275,9 @@ def image_exists(name: str) -> bool:
     return _docker_exists("image", "inspect", name)
 
 
-def repo_root() -> Path:
+def repo_root() -> Path | None:
     r = run(["git", "rev-parse", "--show-toplevel"], capture=True, check=False)
-    if r.returncode != 0:
-        die("Not inside a git repository.")
-    return Path(r.stdout.strip())
+    return Path(r.stdout.strip()) if r.returncode == 0 else None
 
 
 def die(msg: str):
