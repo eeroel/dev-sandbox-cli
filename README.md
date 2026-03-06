@@ -1,9 +1,11 @@
 # sandbox
 THIS IS A WORK IN PROGRESS. USE AT YOUR OWN RISK.
 
-Dev sandbox container manager (podman/docker, docker-compose-free).
+Dev sandbox container manager (podman/docker).
 
-Give an LLM agent a clean, isolated environment to work in — your repo is configured as a read-only remote for the agent to clone from, controlled internet access via an allowlist, and persistent state across restarts.
+Give an LLM agent a clean, isolated environment to work in — your repo is configured as a read-only remote for the agent, internet access is controlled via an allowlist, and state can be persisted across restarts via mounts.
+
+Minimal internet access is a first-class use case: dependencies can be supplied by updating the Dockerfile and restarting the container.
 
 ## Install
 ```bash

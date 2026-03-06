@@ -41,10 +41,10 @@ DOCKER = shutil.which("podman") or shutil.which("docker")
 
 
 
-def load_profile(profile_dir: Path) -> dict:
-    """Load profile from a directory.
+def load_template(template_dir: Path) -> dict:
+    """Load template from a directory.
 
-    A profile directory must contain:
+    A template directory must contain:
       image/Dockerfile  — required, Docker build context
       config.json       — required, keys: mounts (object), inject (array, optional)
     And may also contain:
@@ -55,49 +55,49 @@ def load_profile(profile_dir: Path) -> dict:
     at provision time (and on `replace`), so the Dockerfile can COPY them into the image.
     These files are seeded once — edits to the repo originals have no effect until `replace`.
     """
-    profile = {
+    template = {
         "allowlist": [],
         "inject": [],
     }
 
-    profile_dir = profile_dir.resolve()
-    if not profile_dir.exists():
-        die(f"Profile directory not found: {profile_dir}")
-    if not profile_dir.is_dir():
-        die(f"Profile must be a directory: {profile_dir}")
+    template_dir = template_dir.resolve()
+    if not template_dir.exists():
+        die(f"Template directory not found: {template_dir}")
+    if not template_dir.is_dir():
+        die(f"Template must be a directory: {template_dir}")
 
-    image_dir = profile_dir / "image"
+    image_dir = template_dir / "image"
     if not image_dir.exists():
-        die(f"Profile is missing image/ directory: {profile_dir}")
+        die(f"Template is missing image/ directory: {template_dir}")
     if not (image_dir / "Dockerfile").exists():
-        die(f"Profile image/ directory has no Dockerfile: {image_dir}")
-    profile["image_files"] = {
+        die(f"Template image/ directory has no Dockerfile: {image_dir}")
+    template["image_files"] = {
         str(p.relative_to(image_dir)): p.read_text()
         for p in image_dir.rglob("*") if p.is_file()
     }
 
-    config_path = profile_dir / "config.json"
+    config_path = template_dir / "config.json"
     if not config_path.exists():
-        die(f"Profile is missing config.json: {profile_dir}")
+        die(f"Template is missing config.json: {template_dir}")
     try:
         cfg = json.loads(config_path.read_text())
     except json.JSONDecodeError as e:
         die(f"Invalid JSON in {config_path}: {e}")
     if "mounts" not in cfg or not isinstance(cfg["mounts"], dict):
         die(f"{config_path}: 'mounts' must be a JSON object")
-    profile["mounts"] = cfg["mounts"]
-    profile["inject"] = cfg.get("inject", [])
-    if not isinstance(profile["inject"], list):
+    template["mounts"] = cfg["mounts"]
+    template["inject"] = cfg.get("inject", [])
+    if not isinstance(template["inject"], list):
         die(f"{config_path}: 'inject' must be a JSON array")
 
-    allowlist_path = profile_dir / "allowlist.txt"
+    allowlist_path = template_dir / "allowlist.txt"
     if allowlist_path.exists():
-        profile["allowlist"] = [
+        template["allowlist"] = [
             line.strip() for line in allowlist_path.read_text().splitlines()
             if line.strip() and not line.startswith("#")
         ]
 
-    return profile
+    return template
 
 
 # ---------------------------------------------------------------------------
@@ -108,9 +108,9 @@ def load_profile(profile_dir: Path) -> dict:
 class Sandbox:
     name: str
     repo: Path
-    # profile is only used during first-time provisioning (_provision).
+    # template is only used during first-time provisioning (_provision) and replace.
     # After that, seeded files on disk are the source of truth.
-    profile: dict | None = None
+    template: dict | None = None
 
     # --- Paths ---------------------------------------------------
 
@@ -488,7 +488,7 @@ def up(sb: Sandbox, no_cache=False):
     """Provision (first time) and start the sandbox. No-op if already running."""
     print(f"\n=== sandbox up: {sb.name} ===\n")
 
-    if not sb.meta_dir.exists() and sb.profile is None:
+    if not sb.meta_dir.exists() and sb.template is None:
         die("No existing sandbox found and no template provided. "
             "Run from a directory containing .sandbox-template, or use --template.")
 
@@ -532,7 +532,7 @@ def replace(sb: Sandbox, no_cache=False):
     """Wipe meta, re-seed from template, rebuild image, restart. Volumes and workspace are preserved."""
     if not sb.meta_dir.exists():
         die(f"Sandbox '{sb.name}' has not been provisioned. Run `sandbox up` first.")
-    if sb.profile is None:
+    if sb.template is None:
         die("No template provided. Run from a directory containing .sandbox-template, or use --template.")
     print(f"\n=== sandbox replace: {sb.name} ===\n")
     print(f"[replace] Stopping and wiping meta for '{sb.name}' ...")
@@ -543,9 +543,9 @@ def replace(sb: Sandbox, no_cache=False):
     _start(sb)
 
 
-def _copy_inject_files(sb: Sandbox, profile: dict):
+def _copy_inject_files(sb: Sandbox, template: dict):
     """Copy inject files from the repo into image/ so the Dockerfile can COPY them."""
-    for rel_path in profile.get("inject", []):
+    for rel_path in template.get("inject", []):
         src = sb.repo / rel_path
         if not src.exists():
             print(f"[inject] WARNING: {src} not found — skipping.")
@@ -565,26 +565,26 @@ def _provision(sb: Sandbox):
         return
 
     print(f"[provision] First-time setup for '{sb.name}' ...")
-    profile = sb.profile
+    template = sb.template
 
     sb.meta_dir.mkdir(parents=True, exist_ok=True)
     sb.workspace_dir.mkdir(parents=True, exist_ok=True)
     sb.state_dir.mkdir(parents=True, exist_ok=True)
 
-    config_data = {"mounts": profile["mounts"], "inject": profile["inject"]}
+    config_data = {"mounts": template["mounts"], "inject": template["inject"]}
     sb.config_file.write_text(json.dumps(config_data, indent=2))
     print(f"[provision] Wrote {sb.config_file}")
 
     sb.image_dir.mkdir(parents=True, exist_ok=True)
-    for filename, file_content in profile["image_files"].items():
+    for filename, file_content in template["image_files"].items():
         dest = sb.image_dir / filename
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(file_content)
         print(f"[provision] Wrote {dest}")
 
-    _copy_inject_files(sb, profile)
+    _copy_inject_files(sb, template)
 
-    allowlist = profile.get("allowlist", [])
+    allowlist = template.get("allowlist", [])
     sb.allowlist_path.write_text(
         "# Squid allowlist — one domain per line, # = comment\n"
         + "".join(d + "\n" for d in allowlist)
@@ -826,22 +826,22 @@ def edit_mounts(sb: Sandbox):
             up(sb)
 
 
-def cmd_init(profile_name: str):
+def cmd_init(template_name: str):
     dest = Path.cwd() / ".sandbox-template"
     if dest.exists():
         die(f".sandbox-template already exists in {Path.cwd()}. Remove it first to reinitialise.")
 
-    profiles_dir = Path(__file__).parent / "profiles"
-    if not profiles_dir.exists():
-        die(f"Profiles directory not found at {profiles_dir}. Is the package installed correctly?")
+    templates_dir = Path(__file__).parent / "templates"
+    if not templates_dir.exists():
+        die(f"Templates directory not found at {templates_dir}. Is the package installed correctly?")
 
-    profile_dir = profiles_dir / profile_name
-    if not profile_dir.exists():
-        available = [d.name for d in profiles_dir.iterdir() if d.is_dir()]
-        die(f"Profile '{profile_name}' not found. Available: {', '.join(sorted(available))}")
+    template_dir = templates_dir / template_name
+    if not template_dir.exists():
+        available = [d.name for d in templates_dir.iterdir() if d.is_dir()]
+        die(f"Template '{template_name}' not found. Available: {', '.join(sorted(available))}")
 
-    shutil.copytree(profile_dir, dest)
-    print(f"[init] Initialised .sandbox-template from profile '{profile_name}' in {Path.cwd()}")
+    shutil.copytree(template_dir, dest)
+    print(f"[init] Initialised .sandbox-template from '{template_name}' in {Path.cwd()}")
     print(f"  Edit {dest} to customise, then run: sandbox up")
 
 
@@ -866,7 +866,7 @@ def parse_args():
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_init = sub.add_parser("init", help="Initialise .sandbox-template in current directory")
-    p_init.add_argument("profile_name", nargs="?", default="default", metavar="PROFILE")
+    p_init.add_argument("template_name", nargs="?", default="default", metavar="TEMPLATE")
 
     p_up = sub.add_parser("up", help="Provision and start sandbox (no-op if already running)")
     p_up.add_argument("--name", "-n", default=_REPO_DEFAULT)
@@ -917,7 +917,7 @@ def main():
         die("Neither podman nor docker found in PATH. Install one or use --docker.")
 
     if args.command == "init":
-        cmd_init(args.profile_name)
+        cmd_init(args.template_name)
     elif args.command == "up":
         sb = resolve_sandbox(args)
         if args.template:
@@ -928,7 +928,7 @@ def main():
         else:
             template_dir = None
         if template_dir:
-            sb.profile = load_profile(template_dir)
+            sb.template = load_template(template_dir)
         up(sb, no_cache=args.no_cache)
     elif args.command == "restart":
         sb = resolve_sandbox(args)
@@ -942,7 +942,7 @@ def main():
             print(f"[template] Using .sandbox-template from {Path.cwd()}")
         else:
             die("No template found. Run from a directory containing .sandbox-template, or use --template.")
-        sb.profile = load_profile(template_dir)
+        sb.template = load_template(template_dir)
         replace(sb, no_cache=args.no_cache)
     elif args.command == "down":
         sb = resolve_sandbox(args)
