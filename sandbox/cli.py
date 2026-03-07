@@ -21,7 +21,7 @@ import shutil
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
 
@@ -35,10 +35,43 @@ SANDBOX_HOME = Path.home() / ".sandbox"
 
 NETWORK_NAME = "sandbox-net"          # internal only — sandbox containers cannot reach internet directly
 EXTERNAL_NETWORK_NAME = "sandbox-external"  # squid gets this too, for actual internet access
+HOST_NETWORK_NAME = "sandbox-host"    # non-internal, for host service access
 SQUID_IMAGE = "ubuntu/squid:latest"
 SQUID_PORT = 3128
 
-DOCKER = shutil.which("podman") or shutil.which("docker")
+
+@dataclass
+class Config:
+    docker: str  # path to podman or docker binary
+
+    @property
+    def is_podman(self) -> bool:
+        return Path(self.docker).name == "podman"
+
+    @property
+    def host_gateway_hostname(self) -> str:
+        return "host.containers.internal" if self.is_podman else "host.docker.internal"
+
+    @property
+    def host_gateway_add_host(self) -> str | None:
+        """Returns --add-host argument for reaching host services, or None if injected automatically."""
+        if self.is_podman:
+            return f"{self.host_gateway_hostname}:host-gateway"
+        if sys.platform == "darwin":
+            return None  # Docker Desktop injects host.docker.internal automatically
+        # TODO: Linux + Docker — host-gateway requires Docker 20.10+
+        return f"{self.host_gateway_hostname}:host-gateway"
+
+    @classmethod
+    def detect(cls, override: str | None = None) -> "Config":
+        docker = override or shutil.which("podman") or shutil.which("docker")
+        if not docker:
+            die("Neither podman nor docker found in PATH. Install one or use --docker.")
+        return cls(docker=docker)
+
+
+# module-level config, set in main() after arg parsing
+cfg: Config = None  # type: ignore
 
 
 
@@ -47,19 +80,17 @@ def load_template(template_dir: Path) -> dict:
 
     A template directory must contain:
       image/Dockerfile  — required, Docker build context
-      config.json       — required, keys: mounts (object), inject (array, optional)
+      config.json       — required, keys: mounts (object), inject (array, optional),
+                          allowlist (array, optional), denylist (array, optional),
+                          host_ports (array of ints, optional)
     And may also contain:
       image/*           — any other files the Dockerfile COPYs
-      allowlist.txt     — optional, one domain per line
 
     inject: list of file paths relative to the repo root that are copied into image/
     at provision time (and on `replace`), so the Dockerfile can COPY them into the image.
     These files are seeded once — edits to the repo originals have no effect until `replace`.
     """
-    template = {
-        "allowlist": [],
-        "inject": [],
-    }
+    template = {"inject": []}
 
     template_dir = template_dir.resolve()
     if not template_dir.exists():
@@ -81,22 +112,18 @@ def load_template(template_dir: Path) -> dict:
     if not config_path.exists():
         die(f"Template is missing config.json: {template_dir}")
     try:
-        cfg = json.loads(config_path.read_text())
+        cfg_json = json.loads(config_path.read_text())
     except json.JSONDecodeError as e:
         die(f"Invalid JSON in {config_path}: {e}")
-    if "mounts" not in cfg or not isinstance(cfg["mounts"], dict):
+    if "mounts" not in cfg_json or not isinstance(cfg_json["mounts"], dict):
         die(f"{config_path}: 'mounts' must be a JSON object")
-    template["mounts"] = cfg["mounts"]
-    template["inject"] = cfg.get("inject", [])
+    template["mounts"] = cfg_json["mounts"]
+    template["inject"] = cfg_json.get("inject", [])
     if not isinstance(template["inject"], list):
         die(f"{config_path}: 'inject' must be a JSON array")
-
-    allowlist_path = template_dir / "allowlist.txt"
-    if allowlist_path.exists():
-        template["allowlist"] = [
-            line.strip() for line in allowlist_path.read_text().splitlines()
-            if line.strip() and not line.startswith("#")
-        ]
+    for key in ("allowlist", "denylist", "host_ports"):
+        if key in cfg_json:
+            template[key] = cfg_json[key]
 
     return template
 
@@ -134,14 +161,6 @@ class Sandbox:
     @property
     def squid_container_name(self) -> str:
         return f"sandbox-squid-{self.name}"
-
-    @property
-    def allowlist_path(self) -> Path:
-        return self.meta_dir / "allowlist.txt"
-
-    @property
-    def denylist_path(self) -> Path:
-        return self.meta_dir / "denylist.txt"
 
     @property
     def container_name(self) -> str:
@@ -301,7 +320,7 @@ def run(cmd: list, capture=False, check=True, **kwargs):
 
 
 def _docker_exists(*docker_args: str) -> bool:
-    return run([DOCKER, *docker_args], capture=True, check=False).returncode == 0
+    return run([cfg.docker, *docker_args], capture=True, check=False).returncode == 0
 
 
 def container_exists(name: str) -> bool:
@@ -310,7 +329,7 @@ def container_exists(name: str) -> bool:
 
 def container_running(name: str) -> bool:
     r = run(
-        [DOCKER, "inspect", "--format", "{{.State.Running}}", name],
+        [cfg.docker, "inspect", "--format", "{{.State.Running}}", name],
         capture=True,
         check=False,
     )
@@ -346,22 +365,22 @@ def edit_file(path: Path) -> bool:
 # Squid config generation
 # ---------------------------------------------------------------------------
 
-def write_squid_conf(sb: Sandbox, allowlist: list[str], denylist: list[str]) -> Path:
+def write_squid_conf(sb: Sandbox, allowlist: list[str] | None, denylist: list[str] | None) -> Path:
     conf_dir = sb.meta_dir / "squid"
     conf_dir.mkdir(parents=True, exist_ok=True)
 
-    if allowlist:
-        # Allowlist mode: only listed domains allowed, everything else denied
+    if allowlist is not None:
+        # Allowlist mode: key present in config — only listed domains allowed, everything else denied
         acl_lines = "\n".join(f"acl allowed_domains dstdomain .{d}" for d in allowlist)
-        access_rules = f"{acl_lines}\nhttp_access allow allowed_domains\nhttp_access deny all"
+        access_rules = (f"{acl_lines}\nhttp_access allow allowed_domains\n" if acl_lines else "") + "http_access deny all"
         mode_comment = "# Mode: allowlist"
-    elif denylist:
+    elif denylist is not None and denylist:
         # Denylist mode: listed domains blocked, everything else allowed
         acl_lines = "\n".join(f"acl denied_domains dstdomain .{d}" for d in denylist)
         access_rules = f"{acl_lines}\nhttp_access deny denied_domains\nhttp_access allow all"
         mode_comment = "# Mode: denylist"
     else:
-        # Unrestricted
+        # Unrestricted: neither key present
         access_rules = "http_access allow all"
         mode_comment = "# Mode: unrestricted"
 
@@ -390,54 +409,59 @@ cache_store_log none
 # Infrastructure: network + squid
 # ---------------------------------------------------------------------------
 
-def ensure_network():
+def ensure_network(host_ports: list[int] | None = None):
     if not network_exists(NETWORK_NAME):
         print(f"[network] Creating {NETWORK_NAME} (internal) ...")
-        run([DOCKER, "network", "create", "--internal", NETWORK_NAME])
+        run([cfg.docker, "network", "create", "--internal", NETWORK_NAME])
     else:
         print(f"[network] {NETWORK_NAME} already exists.")
 
     if not network_exists(EXTERNAL_NETWORK_NAME):
         print(f"[network] Creating {EXTERNAL_NETWORK_NAME} ...")
-        run([DOCKER, "network", "create", EXTERNAL_NETWORK_NAME])
+        run([cfg.docker, "network", "create", EXTERNAL_NETWORK_NAME])
     else:
         print(f"[network] {EXTERNAL_NETWORK_NAME} already exists.")
 
+    if host_ports:
+        if not network_exists(HOST_NETWORK_NAME):
+            print(f"[network] Creating {HOST_NETWORK_NAME} (host access) ...")
+            run([cfg.docker, "network", "create", HOST_NETWORK_NAME])
+        else:
+            print(f"[network] {HOST_NETWORK_NAME} already exists.")
 
-def load_sandbox_allowlist(sb: Sandbox) -> list[str]:
-    if not sb.allowlist_path.exists():
-        return []
-    return [line.strip() for line in sb.allowlist_path.read_text().splitlines()
-            if line.strip() and not line.startswith("#")]
+
+def load_sandbox_allowlist(sb: Sandbox) -> list[str] | None:
+    """Returns list if 'allowlist' key exists in config (even if empty), None if absent."""
+    cfg_data = load_config(sb)
+    return cfg_data.get("allowlist", None)
 
 
-def load_sandbox_denylist(sb: Sandbox) -> list[str]:
-    if not sb.denylist_path.exists():
-        return []
-    return [line.strip() for line in sb.denylist_path.read_text().splitlines()
-            if line.strip() and not line.startswith("#")]
+def load_sandbox_denylist(sb: Sandbox) -> list[str] | None:
+    """Returns list if 'denylist' key exists in config (even if empty), None if absent."""
+    cfg_data = load_config(sb)
+    return cfg_data.get("denylist", None)
 
 
 def ensure_squid(sb: Sandbox):
     allowlist = load_sandbox_allowlist(sb)
     denylist = load_sandbox_denylist(sb)
 
-    if allowlist and denylist:
+    if allowlist is not None and denylist is not None and denylist:
         print("[squid] WARNING: both allowlist and denylist set — denylist ignored.")
 
     # Always recreate the squid container so list changes are picked up on every `up`.
     if container_running(sb.squid_container_name):
         print(f"[squid] Recreating {sb.squid_container_name} to apply latest config ...")
-        run([DOCKER, "stop", "-t", "0", sb.squid_container_name], check=False, capture=True)
-        run([DOCKER, "rm", sb.squid_container_name], check=False, capture=True)
+        run([cfg.docker, "stop", "-t", "0", sb.squid_container_name], check=False, capture=True)
+        run([cfg.docker, "rm", sb.squid_container_name], check=False, capture=True)
     elif container_exists(sb.squid_container_name):
         print(f"[squid] Removing stopped squid container {sb.squid_container_name} ...")
-        run([DOCKER, "rm", sb.squid_container_name])
+        run([cfg.docker, "rm", sb.squid_container_name])
 
     conf_dir = write_squid_conf(sb, allowlist, denylist)
     print(f"[squid] Starting {sb.squid_container_name} ...")
     run([
-        DOCKER, "run", "-d",
+        cfg.docker, "run", "-d",
         "--name", sb.squid_container_name,
         "--network", NETWORK_NAME,
         "--restart", "unless-stopped",
@@ -445,7 +469,7 @@ def ensure_squid(sb: Sandbox):
         SQUID_IMAGE,
     ])
     # Also connect squid to the external network so it can reach the internet.
-    run([DOCKER, "network", "connect", EXTERNAL_NETWORK_NAME, sb.squid_container_name])
+    run([cfg.docker, "network", "connect", EXTERNAL_NETWORK_NAME, sb.squid_container_name])
 
 
 # ---------------------------------------------------------------------------
@@ -469,7 +493,7 @@ def build_image(sb: Sandbox, no_cache=False) -> None:
 
     print(f"[image] Building {sb.image_tag}{' [no-cache]' if no_cache else ''} ...")
     print(f"[image] Dockerfile: {sb.dockerfile_path}")
-    cmd = [DOCKER, "build", "-t", sb.image_tag, "-f", str(sb.dockerfile_path)]
+    cmd = [cfg.docker, "build", "-t", sb.image_tag, "-f", str(sb.dockerfile_path)]
     if no_cache:
         cmd.append("--no-cache")
     # Build context is image/ — only seeded and injected files are visible to the Dockerfile.
@@ -517,11 +541,11 @@ def wait_for_clone(sb: Sandbox, timeout=60):
             return True
         if not container_running(sb.container_name):
             print("[git] Container stopped unexpectedly during clone.")
-            print(f"      Check logs with: {DOCKER} logs {sb.container_name}")
+            print(f"      Check logs with: {cfg.docker} logs {sb.container_name}")
             return False
         time.sleep(0.5)
     print(f"[git] Timeout: Clone did not complete within {timeout}s.")
-    print(f"      Check logs with: {DOCKER} logs {sb.container_name}")
+    print(f"      Check logs with: {cfg.docker} logs {sb.container_name}")
     return False
 
 
@@ -549,7 +573,10 @@ def up(sb: Sandbox, template_dir: Path | None = None, no_cache=False):
 
     is_new = not sb.meta_dir.exists()
 
-    ensure_network()
+    host_ports = (sb.template or {}).get("host_ports") or (
+        load_config(sb).get("host_ports") if sb.meta_dir.exists() else []
+    )
+    ensure_network(host_ports)
     try:
         _provision(sb)
 
@@ -563,7 +590,7 @@ def up(sb: Sandbox, template_dir: Path | None = None, no_cache=False):
 
         if container_exists(sb.container_name):
             print(f"[container] Removing stopped container {sb.container_name} ...")
-            run([DOCKER, "rm", sb.container_name], check=False, capture=True)
+            run([cfg.docker, "rm", sb.container_name], check=False, capture=True)
 
         _start(sb)
     except BaseException:
@@ -633,6 +660,12 @@ def _provision(sb: Sandbox):
     sb.state_dir.mkdir(parents=True, exist_ok=True)
 
     config_data = {"mounts": template["mounts"], "inject": template["inject"]}
+    if "allowlist" in template:
+        config_data["allowlist"] = template["allowlist"]
+    if "denylist" in template:
+        config_data["denylist"] = template["denylist"]
+    if "host_ports" in template:
+        config_data["host_ports"] = template["host_ports"]
     sb.config_file.write_text(json.dumps(config_data, indent=2))
     print(f"[provision] Wrote {sb.config_file}")
 
@@ -645,16 +678,6 @@ def _provision(sb: Sandbox):
 
     _copy_inject_files(sb, template)
 
-    allowlist = template.get("allowlist", [])
-    sb.allowlist_path.write_text(
-        "# Squid allowlist — one domain per line, # = comment\n"
-        + "".join(d + "\n" for d in allowlist)
-    )
-    print(f"[provision] Wrote {sb.allowlist_path}")
-
-    sb.denylist_path.write_text("# Squid denylist — one domain per line, # = comment\n")
-    print(f"[provision] Wrote {sb.denylist_path}")
-
     sb.save_meta({
         "sandbox_name": sb.name,
         "repo": str(sb.repo) if sb.repo else None,
@@ -664,12 +687,15 @@ def _provision(sb: Sandbox):
 
 def _start(sb: Sandbox):
     """Start the sandbox container. Assumes _provision() has already run."""
+    cfg_data = load_config(sb)
+    host_ports = cfg_data.get("host_ports", [])
+
     ensure_squid(sb)
 
     proxy_url = f"http://{sb.squid_container_name}:{SQUID_PORT}"
 
     docker_cmd = [
-        DOCKER, "run", "-d", "-i",
+        cfg.docker, "run", "-d", "-i",
         "--name", sb.container_name,
         "--network", NETWORK_NAME,
         "-e", f"http_proxy={proxy_url}",
@@ -692,13 +718,22 @@ def _start(sb: Sandbox):
         host_path.mkdir(parents=True, exist_ok=True)
         docker_cmd.extend(["-v", f"{host_path}:{container_path}:rw"])
 
-    docker_cmd.extend([
-        sb.image_tag,
-        "bash",
-    ])
+    if host_ports:
+        add_host = cfg.host_gateway_add_host
+        if add_host:
+            docker_cmd.extend(["--add-host", add_host])
+        docker_cmd.extend([
+            "-e", f"no_proxy=localhost,127.0.0.1,{cfg.host_gateway_hostname}",
+        ])
+
+    docker_cmd.extend([sb.image_tag, "bash"])
 
     print(f"[container] Starting {sb.container_name} ...")
-    run(docker_cmd)  # raises CalledProcessError on failure
+    run(docker_cmd)
+
+    if host_ports:
+        run([cfg.docker, "network", "connect", HOST_NETWORK_NAME, sb.container_name])
+        print(f"[container] Host services reachable at {cfg.host_gateway_hostname}: {host_ports}")
 
     print(f"\n[container] {sb.container_name} is up.")
     print(f"  Workspace : {sb.workspace_dir}")
@@ -710,24 +745,24 @@ def _start(sb: Sandbox):
             setup_git_remotes(sb)
 
     print(f"\n  Attach with: {Path(sys.argv[0]).name} exec --name {sb.name}")
-    print(f"  Or directly: {DOCKER} exec -it -w /llm-workspace {sb.container_name} bash\n")
+    print(f"  Or directly: {cfg.docker} exec -it -w /llm-workspace {sb.container_name} bash\n")
 
 
 def down(sb: Sandbox):
     if container_running(sb.container_name):
         print(f"[container] Stopping {sb.container_name} (volumes preserved) ...")
-        run([DOCKER, "stop", "-t", "0", sb.container_name], check=False)
-        run([DOCKER, "rm", sb.container_name], check=False, capture=True)
+        run([cfg.docker, "stop", "-t", "0", sb.container_name], check=False)
+        run([cfg.docker, "rm", sb.container_name], check=False, capture=True)
     elif container_exists(sb.container_name):
-        run([DOCKER, "rm", sb.container_name], check=False, capture=True)
+        run([cfg.docker, "rm", sb.container_name], check=False, capture=True)
     else:
         print(f"[container] {sb.container_name} not found.")
 
     if container_running(sb.squid_container_name):
         print(f"[squid] Stopping {sb.squid_container_name} ...")
-        run([DOCKER, "stop", "-t", "0", sb.squid_container_name], check=False, capture=True)
+        run([cfg.docker, "stop", "-t", "0", sb.squid_container_name], check=False, capture=True)
     if container_exists(sb.squid_container_name):
-        run([DOCKER, "rm", "-f", sb.squid_container_name], check=False, capture=True)
+        run([cfg.docker, "rm", "-f", sb.squid_container_name], check=False, capture=True)
 
 
 def _unprovision(sb: Sandbox, force: bool = False):
@@ -738,15 +773,15 @@ def _unprovision(sb: Sandbox, force: bool = False):
     """
     # Stop/remove main container
     if container_running(sb.container_name):
-        run([DOCKER, "stop", "-t", "0", sb.container_name], check=False, capture=True)
+        run([cfg.docker, "stop", "-t", "0", sb.container_name], check=False, capture=True)
     if container_exists(sb.container_name):
-        run([DOCKER, "rm", "-f", sb.container_name], check=False, capture=True)
+        run([cfg.docker, "rm", "-f", sb.container_name], check=False, capture=True)
 
     # Stop/remove squid container
     if container_running(sb.squid_container_name):
-        run([DOCKER, "stop", "-t", "0", sb.squid_container_name], check=False, capture=True)
+        run([cfg.docker, "stop", "-t", "0", sb.squid_container_name], check=False, capture=True)
     if container_exists(sb.squid_container_name):
-        run([DOCKER, "rm", "-f", sb.squid_container_name], check=False, capture=True)
+        run([cfg.docker, "rm", "-f", sb.squid_container_name], check=False, capture=True)
 
     # Remove git remote on host (may or may not have been added)
     if sb.repo is not None:
@@ -776,7 +811,7 @@ def destroy(sb: Sandbox):
 
     if image_exists(sb.image_tag):
         print(f"[image] Removing {sb.image_tag} ...")
-        run([DOCKER, "rmi", sb.image_tag], check=False)
+        run([cfg.docker, "rmi", sb.image_tag], check=False)
 
     print(f"[destroy] {sb.name} destroyed.")
 
@@ -791,7 +826,7 @@ def infra_down():
     for net in (NETWORK_NAME, EXTERNAL_NETWORK_NAME):
         if network_exists(net):
             print(f"[infra] Removing network {net} ...")
-            r = run([DOCKER, "network", "rm", net], check=False, capture=True)
+            r = run([cfg.docker, "network", "rm", net], check=False, capture=True)
             if r.returncode != 0:
                 die(f"ERROR: Could not remove network {net}.\n"
                     "       It is likely still in use by running sandboxes.")
@@ -802,7 +837,7 @@ def infra_down():
 
 
 def status():
-    r = run([DOCKER, "ps", "-a", "--format", "{{.Names}} {{.State}}"], capture=True, check=False)
+    r = run([cfg.docker, "ps", "-a", "--format", "{{.Names}} {{.State}}"], capture=True, check=False)
     c_states = {}
     for line in r.stdout.strip().splitlines():
         parts = line.split(None, 1)
@@ -904,7 +939,7 @@ def exec_cmd(sb: Sandbox, cmd: list[str]):
     if not container_running(sb.container_name):
         die(f"{sb.container_name} is not running. Run `sandbox.py up --name {sb.name}` first.")
     cmd = cmd or ["bash"]
-    os.execvp(DOCKER, [DOCKER, "exec", "-it", "-w", "/llm-workspace", sb.container_name] + cmd)
+    os.execvp(cfg.docker, [cfg.docker, "exec", "-it", "-w", "/llm-workspace", sb.container_name] + cmd)
 
 
 # ---------------------------------------------------------------------------
@@ -962,11 +997,8 @@ def parse_args():
 def main():
     args = parse_args()
 
-    global DOCKER
-    if args.docker:
-        DOCKER = args.docker
-    if not DOCKER:
-        die("Neither podman nor docker found in PATH. Install one or use --docker.")
+    global cfg
+    cfg = Config.detect(override=args.docker)
 
     sb = lambda: resolve_sandbox(args)
     commands = {
