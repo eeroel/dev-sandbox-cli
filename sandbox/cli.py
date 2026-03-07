@@ -23,6 +23,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterator
 
 _REPO_DEFAULT = "__repo__"  # sentinel: derive name from repo dir
 
@@ -164,26 +165,43 @@ class Sandbox:
 
     # --- Meta persistence --------------------------------------------------
 
-    def load_meta(self) -> dict:
-        p = self.meta_dir / "meta.json"
-        return json.loads(p.read_text()) if p.exists() else {}
+    @staticmethod
+    def _read_meta(name: str) -> dict | None:
+        p = SANDBOX_HOME / name / "config" / "meta.json"
+        if not p.exists():
+            return None
+        try:
+            return json.loads(p.read_text())
+        except (json.JSONDecodeError, OSError):
+            return None
+
+    @classmethod
+    def from_meta(cls, name: str, meta: dict) -> "Sandbox":
+        repo_str = meta.get("repo")
+        return cls(name=name, repo=Path(repo_str) if repo_str else None)
+
+    @classmethod
+    def load(cls, name: str) -> "Sandbox":
+        meta = cls._read_meta(name)
+        if meta is None:
+            die(f"No meta found for sandbox '{name}'. Has it been created with `up`?")
+        return cls.from_meta(name, meta)
+
+    @classmethod
+    def iter_all(cls) -> "Iterator[Sandbox]":
+        if not SANDBOX_HOME.exists():
+            return
+        for d in sorted(SANDBOX_HOME.iterdir()):
+            if not d.is_dir():
+                continue
+            meta = cls._read_meta(d.name)
+            if meta is not None:
+                yield cls.from_meta(d.name, meta)
 
     def save_meta(self, meta: dict):
         p = self.meta_dir / "meta.json"
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(json.dumps(meta, indent=2))
-
-    # --- Alternative constructor ------------------------------------------
-
-    @classmethod
-    def load(cls, name: str) -> "Sandbox":
-        meta_path = SANDBOX_HOME / name / "config" / "meta.json"
-        if not meta_path.exists():
-            die(f"No meta found for sandbox '{name}'. Has it been created with `up`?")
-        meta = json.loads(meta_path.read_text())
-        repo_str = meta.get("repo")
-        repo = Path(repo_str) if repo_str else None
-        return cls(name=name, repo=repo)
 
 
 # ---------------------------------------------------------------------------
@@ -212,24 +230,9 @@ def load_mounts(sb: Sandbox) -> dict:
 # ---------------------------------------------------------------------------
 
 def find_sandboxes_for_repo(repo: Path) -> list[str]:
-    """Scan all meta.json files and return sandbox names whose repo matches."""
-    if not SANDBOX_HOME.exists():
-        return []
-    matches = []
-    for d in SANDBOX_HOME.iterdir():
-        if not d.is_dir():
-            continue
-        meta_path = d / "config" / "meta.json"
-        if not meta_path.exists():
-            continue
-        try:
-            meta = json.loads(meta_path.read_text())
-        except (json.JSONDecodeError, OSError):
-            continue
-        repo_str = meta.get("repo")
-        if repo_str and Path(repo_str).resolve() == repo.resolve():
-            matches.append(d.name)
-    return matches
+    """Return sandbox names whose repo matches the given path."""
+    return [sb.name for sb in Sandbox.iter_all()
+            if sb.repo and sb.repo.resolve() == repo.resolve()]
 
 
 def next_available_name(base: str) -> str:
@@ -813,38 +816,24 @@ def status():
     print(f"  Network (external): {ext_ok} {EXTERNAL_NETWORK_NAME}")
 
     print("\n=== Sandboxes ===")
-    if not SANDBOX_HOME.exists():
+    sandboxes = list(Sandbox.iter_all())
+    if not sandboxes:
         print("  No sandboxes found.")
     else:
-        instances = sorted([d for d in SANDBOX_HOME.iterdir() if d.is_dir() and (d / "config" / "meta.json").exists()])
-        if not instances:
-            print("  No sandboxes found.")
-        else:
-            for d in instances:
-                name = d.name
-                meta_path = d / "config" / "meta.json"
-                meta = json.loads(meta_path.read_text())
-
-                repo_str = meta.get("repo") or "None (no-git mode)"
-
-                container_name = f"sandbox-{name}"
-                state = c_states.get(container_name, "no container")
-
-                squid_name = f"sandbox-squid-{name}"
-                squid_state = c_states.get(squid_name, "no container")
-
-                df = d / "config" / "image"
-                df_info = str(df) if df.exists() else "None found"
-
-                print(f"  Sandbox: {name}")
-                print(f"    State     : {state}")
-                print(f"    Squid     : {squid_state}")
-                print(f"    Repo      : {repo_str}")
-                print(f"    Image dir : {df_info}")
-                print()
+        for sb in sandboxes:
+            state = c_states.get(sb.container_name, "no container")
+            squid_state = c_states.get(sb.squid_container_name, "no container")
+            df_info = str(sb.image_dir) if sb.image_dir.exists() else "None found"
+            print(f"  Sandbox: {sb.name}")
+            print(f"    State     : {state}")
+            print(f"    Squid     : {squid_state}")
+            print(f"    Repo      : {sb.repo or 'None (no-git mode)'}")
+            print(f"    Image dir : {df_info}")
+            print()
 
     if SANDBOX_HOME.exists():
-        orphans = [d for d in SANDBOX_HOME.iterdir() if d.is_dir() and not (d / "config" / "meta.json").exists()]
+        orphans = [d for d in SANDBOX_HOME.iterdir()
+                   if d.is_dir() and not (d / "config" / "meta.json").exists()]
         if orphans:
             print("=== Orphans (dirs without config/meta.json) ===")
             for o in orphans:
