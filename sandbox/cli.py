@@ -107,7 +107,7 @@ def load_template(template_dir: Path) -> dict:
 @dataclass
 class Sandbox:
     name: str
-    repo: Path
+    repo: Path | None  # None = no-git mode
     # template is only used during first-time provisioning (_provision) and replace.
     # After that, seeded files on disk are the source of truth.
     template: dict | None = None
@@ -137,6 +137,10 @@ class Sandbox:
     @property
     def allowlist_path(self) -> Path:
         return self.meta_dir / "allowlist.txt"
+
+    @property
+    def denylist_path(self) -> Path:
+        return self.meta_dir / "denylist.txt"
 
     @property
     def container_name(self) -> str:
@@ -177,10 +181,9 @@ class Sandbox:
         if not meta_path.exists():
             die(f"No meta found for sandbox '{name}'. Has it been created with `up`?")
         meta = json.loads(meta_path.read_text())
-        repo = meta.get("repo")
-        if not repo:
-            die(f"meta.json for sandbox '{name}' is missing 'repo' field.")
-        return cls(name=name, repo=Path(repo))
+        repo_str = meta.get("repo")
+        repo = Path(repo_str) if repo_str else None
+        return cls(name=name, repo=repo)
 
 
 # ---------------------------------------------------------------------------
@@ -208,29 +211,73 @@ def load_mounts(sb: Sandbox) -> dict:
 # CLI name/repo resolution
 # ---------------------------------------------------------------------------
 
+def find_sandboxes_for_repo(repo: Path) -> list[str]:
+    """Scan all meta.json files and return sandbox names whose repo matches."""
+    if not SANDBOX_HOME.exists():
+        return []
+    matches = []
+    for d in SANDBOX_HOME.iterdir():
+        if not d.is_dir():
+            continue
+        meta_path = d / "config" / "meta.json"
+        if not meta_path.exists():
+            continue
+        try:
+            meta = json.loads(meta_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        repo_str = meta.get("repo")
+        if repo_str and Path(repo_str).resolve() == repo.resolve():
+            matches.append(d.name)
+    return matches
+
+
+def next_available_name(base: str) -> str:
+    """Return base if unused, otherwise base-2, base-3, etc."""
+    if not (SANDBOX_HOME / base).exists():
+        return base
+    i = 2
+    while (SANDBOX_HOME / f"{base}-{i}").exists():
+        i += 1
+    return f"{base}-{i}"
+
+
 def resolve_sandbox(args) -> "Sandbox":
     name_arg = getattr(args, "name", _REPO_DEFAULT)
     repo_arg = getattr(args, "repo", None)
 
+    # Explicit --repo: use it directly, derive name if not given
     if repo_arg:
         repo = Path(repo_arg).resolve()
-        name = repo.name if name_arg == _REPO_DEFAULT else name_arg
+        name = next_available_name(repo.name) if name_arg == _REPO_DEFAULT else name_arg
         return Sandbox(name=name, repo=repo)
 
+    # Explicit --name: load existing meta if present, otherwise create with that name
     if name_arg != _REPO_DEFAULT:
         meta_path = SANDBOX_HOME / name_arg / "config" / "meta.json"
         if meta_path.exists():
             return Sandbox.load(name_arg)
+        # Not yet created — repo optional (no-git mode if not in a repo)
         repo = repo_root()
-        if repo is None:
-            die(f"Sandbox '{name_arg}' not yet created and not inside a git repo. "
-                "Use --repo to specify the repo path.")
         return Sandbox(name=name_arg, repo=repo)
 
+    # No --name, no --repo: invert lookup via repo
     repo = repo_root()
     if repo is None:
         die("Not inside a git repository. Use --repo or --name to specify the sandbox.")
-    return Sandbox(name=repo.name, repo=repo)
+
+    matches = find_sandboxes_for_repo(repo)
+    if len(matches) > 1:
+        die(f"Multiple sandboxes exist for this repo: {', '.join(sorted(matches))}. "
+            "Use --name to specify which one.")
+    if len(matches) == 1:
+        return Sandbox.load(matches[0])
+
+    # No existing sandbox for this repo — create new with auto-suffixed name
+    name = next_available_name(repo.name)
+    if name != repo.name:
+        print(f"[name] '{repo.name}' already taken by a different repo — using '{name}'")
+    return Sandbox(name=name, repo=repo)
 
 
 # ---------------------------------------------------------------------------
@@ -296,23 +343,35 @@ def edit_file(path: Path) -> bool:
 # Squid config generation
 # ---------------------------------------------------------------------------
 
-def write_squid_conf(sb: Sandbox, allowlist: list[str]) -> Path:
+def write_squid_conf(sb: Sandbox, allowlist: list[str], denylist: list[str]) -> Path:
     conf_dir = sb.meta_dir / "squid"
     conf_dir.mkdir(parents=True, exist_ok=True)
-    acl_lines = "\n".join(f"acl allowed_domains dstdomain .{d}" for d in allowlist)
+
+    if allowlist:
+        # Allowlist mode: only listed domains allowed, everything else denied
+        acl_lines = "\n".join(f"acl allowed_domains dstdomain .{d}" for d in allowlist)
+        access_rules = f"{acl_lines}\nhttp_access allow allowed_domains\nhttp_access deny all"
+        mode_comment = "# Mode: allowlist"
+    elif denylist:
+        # Denylist mode: listed domains blocked, everything else allowed
+        acl_lines = "\n".join(f"acl denied_domains dstdomain .{d}" for d in denylist)
+        access_rules = f"{acl_lines}\nhttp_access deny denied_domains\nhttp_access allow all"
+        mode_comment = "# Mode: denylist"
+    else:
+        # Unrestricted
+        access_rules = "http_access allow all"
+        mode_comment = "# Mode: unrestricted"
+
     conf = f"""\
 # Generated by sandbox.py
+{mode_comment}
 http_port {SQUID_PORT}
 
 # Allow localhost (health checks)
 acl localhost src 127.0.0.1/32
-
-# Domain allowlist
-{acl_lines}
-
 http_access allow localhost
-{"http_access allow allowed_domains" if acl_lines else ""}
-http_access deny all
+
+{access_rules}
 
 # Reduce log noise
 access_log /dev/stdout
@@ -349,19 +408,30 @@ def load_sandbox_allowlist(sb: Sandbox) -> list[str]:
             if line.strip() and not line.startswith("#")]
 
 
+def load_sandbox_denylist(sb: Sandbox) -> list[str]:
+    if not sb.denylist_path.exists():
+        return []
+    return [line.strip() for line in sb.denylist_path.read_text().splitlines()
+            if line.strip() and not line.startswith("#")]
+
+
 def ensure_squid(sb: Sandbox):
     allowlist = load_sandbox_allowlist(sb)
+    denylist = load_sandbox_denylist(sb)
 
-    # Always recreate the squid container so allowlist changes are picked up on every `up`.
+    if allowlist and denylist:
+        print("[squid] WARNING: both allowlist and denylist set — denylist ignored.")
+
+    # Always recreate the squid container so list changes are picked up on every `up`.
     if container_running(sb.squid_container_name):
-        print(f"[squid] Recreating {sb.squid_container_name} to apply latest allowlist ...")
+        print(f"[squid] Recreating {sb.squid_container_name} to apply latest config ...")
         run([DOCKER, "stop", "-t", "0", sb.squid_container_name], check=False, capture=True)
         run([DOCKER, "rm", sb.squid_container_name], check=False, capture=True)
     elif container_exists(sb.squid_container_name):
         print(f"[squid] Removing stopped squid container {sb.squid_container_name} ...")
         run([DOCKER, "rm", sb.squid_container_name])
 
-    conf_dir = write_squid_conf(sb, allowlist)
+    conf_dir = write_squid_conf(sb, allowlist, denylist)
     print(f"[squid] Starting {sb.squid_container_name} ...")
     run([
         DOCKER, "run", "-d",
@@ -373,34 +443,6 @@ def ensure_squid(sb: Sandbox):
     ])
     # Also connect squid to the external network so it can reach the internet.
     run([DOCKER, "network", "connect", EXTERNAL_NETWORK_NAME, sb.squid_container_name])
-
-
-# ---------------------------------------------------------------------------
-# Per-sandbox allowlist editor
-# ---------------------------------------------------------------------------
-
-
-def reconfigure_squid(sb: Sandbox):
-    allowlist = load_sandbox_allowlist(sb)
-    write_squid_conf(sb, allowlist)
-    if not container_running(sb.squid_container_name):
-        print("[squid] Not running — config saved, will apply on next start.")
-        return
-    print(f"[squid] Restarting {sb.squid_container_name} ...")
-    run([DOCKER, "restart", sb.squid_container_name])
-
-
-def edit_allowlist(sb: Sandbox):
-    if not sb.allowlist_path.exists():
-        die(f"allowlist.txt not found at {sb.allowlist_path}. Instance may be corrupted — re-run `up`.")
-
-    if not edit_file(sb.allowlist_path):
-        print("[allowlist] No changes.")
-        return
-
-    allowlist = load_sandbox_allowlist(sb)
-    print(f"[allowlist] {len(allowlist)} domain(s) saved; reconfiguring squid ...")
-    reconfigure_squid(sb)
 
 
 # ---------------------------------------------------------------------------
@@ -557,6 +599,10 @@ def replace(sb: Sandbox, template_dir: Path | None = None, no_cache=False):
 
 def _copy_inject_files(sb: Sandbox, template: dict):
     """Copy inject files from the repo into image/ so the Dockerfile can COPY them."""
+    if sb.repo is None:
+        if template.get("inject"):
+            print("[inject] WARNING: inject files specified but no repo configured — skipping.")
+        return
     for rel_path in template.get("inject", []):
         src = sb.repo / rel_path
         if not src.exists():
@@ -603,9 +649,12 @@ def _provision(sb: Sandbox):
     )
     print(f"[provision] Wrote {sb.allowlist_path}")
 
+    sb.denylist_path.write_text("# Squid denylist — one domain per line, # = comment\n")
+    print(f"[provision] Wrote {sb.denylist_path}")
+
     sb.save_meta({
         "sandbox_name": sb.name,
-        "repo": str(sb.repo),
+        "repo": str(sb.repo) if sb.repo else None,
     })
     print(f"[provision] Instance '{sb.name}' provisioned.")
 
@@ -615,7 +664,6 @@ def _start(sb: Sandbox):
     ensure_squid(sb)
 
     proxy_url = f"http://{sb.squid_container_name}:{SQUID_PORT}"
-    git_dir = sb.repo / ".git"
 
     docker_cmd = [
         DOCKER, "run", "-d", "-i",
@@ -626,9 +674,12 @@ def _start(sb: Sandbox):
         "-e", f"HTTP_PROXY={proxy_url}",
         "-e", f"HTTPS_PROXY={proxy_url}",
         "-e", "no_proxy=localhost,127.0.0.1",
-        "-v", f"{git_dir}:/repo-git:ro",
         "-v", f"{sb.workspace_dir}:/llm-workspace:rw",
     ]
+
+    if sb.repo is not None:
+        git_dir = sb.repo / ".git"
+        docker_cmd.extend(["-v", f"{git_dir}:/repo-git:ro"])
 
     for rel_path, container_path in load_mounts(sb).items():
         host_path = (sb.state_dir / rel_path).resolve()
@@ -651,8 +702,9 @@ def _start(sb: Sandbox):
     print(f"  Volumes   : {sb.state_dir}")
     print(f"  Proxy     : {proxy_url}")
 
-    if wait_for_clone(sb):
-        setup_git_remotes(sb)
+    if sb.repo is not None:
+        if wait_for_clone(sb):
+            setup_git_remotes(sb)
 
     print(f"\n  Attach with: {Path(sys.argv[0]).name} exec --name {sb.name}")
     print(f"  Or directly: {DOCKER} exec -it -w /llm-workspace {sb.container_name} bash\n")
@@ -694,11 +746,12 @@ def _unprovision(sb: Sandbox, force: bool = False):
         run([DOCKER, "rm", "-f", sb.squid_container_name], check=False, capture=True)
 
     # Remove git remote on host (may or may not have been added)
-    remote_name = f"agent-{sb.name}"
-    r = run(["git", "-C", str(sb.repo), "remote"], capture=True, check=False)
-    if remote_name in r.stdout.splitlines():
-        print(f"[git] Removing host remote '{remote_name}' ...")
-        run(["git", "-C", str(sb.repo), "remote", "remove", remote_name], check=False)
+    if sb.repo is not None:
+        remote_name = f"agent-{sb.name}"
+        r = run(["git", "-C", str(sb.repo), "remote"], capture=True, check=False)
+        if remote_name in r.stdout.splitlines():
+            print(f"[git] Removing host remote '{remote_name}' ...")
+            run(["git", "-C", str(sb.repo), "remote", "remove", remote_name], check=False)
 
     # Remove config dir — workspace and volumes are left intact unless force=True
     if force:
@@ -772,7 +825,7 @@ def status():
                 meta_path = d / "config" / "meta.json"
                 meta = json.loads(meta_path.read_text())
 
-                repo_str = meta.get("repo", "Unknown")
+                repo_str = meta.get("repo") or "None (no-git mode)"
 
                 container_name = f"sandbox-{name}"
                 state = c_states.get(container_name, "no container")
@@ -903,9 +956,6 @@ def parse_args():
     sub.add_parser("status", help="Show all sandboxes and infrastructure")
     sub.add_parser("infra-down", help="Tear down shared network")
 
-    p_ea = sub.add_parser("edit-allowlist", aliases=["ea"])
-    p_ea.add_argument("--name", "-n", default=_REPO_DEFAULT)
-
     p_ed = sub.add_parser("edit-dockerfile", aliases=["ed"])
     p_ed.add_argument("--name", "-n", default=_REPO_DEFAULT)
 
@@ -938,8 +988,6 @@ def main():
         "destroy":         lambda: destroy(sb()),
         "status":          lambda: status(),
         "infra-down":      lambda: infra_down(),
-        "edit-allowlist":  lambda: edit_allowlist(sb()),
-        "ea":              lambda: edit_allowlist(sb()),
         "edit-dockerfile": lambda: edit_dockerfile(sb()),
         "ed":              lambda: edit_dockerfile(sb()),
         "edit-mounts":     lambda: edit_mounts(sb()),
