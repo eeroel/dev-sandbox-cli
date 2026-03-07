@@ -1,0 +1,6 @@
+{
+  "mounts": {
+    "dropbox/": "/root/dropbox"
+  },
+  "allowlist": []
+}

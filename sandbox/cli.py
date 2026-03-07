@@ -828,6 +828,7 @@ def status():
             print(f"    State     : {state}")
             print(f"    Squid     : {squid_state}")
             print(f"    Repo      : {sb.repo or 'None (no-git mode)'}")
+            print(f"    Volumes   : {sb.state_dir}")
             print(f"    Image dir : {df_info}")
             print()
 
